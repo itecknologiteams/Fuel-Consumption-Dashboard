@@ -88,7 +88,7 @@ export class FuelController {
       `GET /vehicles/${imei}/fuel/current sensorId=${sensorIdStr}`,
     );
 
-    const row = await this.dynQuery.getLatestRow(imei);
+    const row = await this.dynQuery.getLatestRestingRow(imei);
     const ts = row ? new Date(row.dt_tracker).toISOString() : null;
 
     if (sensorIdStr) {

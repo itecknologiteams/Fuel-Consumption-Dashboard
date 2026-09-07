@@ -96,14 +96,16 @@ export const POST_REFUEL_VERIFY_EPS_LITERS = 8.0;
 export const RISE_RETENTION_FRACTION = 0.5;
 
 /**
- * Minimum drop/rise (litres) that counts as a real event while the vehicle is
- * STATIONARY — lowered from the 8 L moving threshold so small siphons and
- * small top-ups are no longer invisible.
+ * Minimum drop/rise (litres) that counts as a real event.
  *
- * Parked, the sensor is steady to a few tenths of a litre, so 3 L sits well
- * clear of the noise floor. Moving, fuel slosh swings the same sensor by
- * 10-15 L between consecutive readings, which is why DROP_ALERT_THRESHOLD /
- * RISE_THRESHOLD (8 L) still govern events with the vehicle in motion.
+ * Events are only ever read off a stationary vehicle, where the sensor is
+ * steady to a few tenths of a litre — so 3 L sits well clear of the noise
+ * floor and small siphons and top-ups are no longer invisible. In motion the
+ * same sensor swings 10-15 L on slosh alone, which is why no threshold makes a
+ * moving reading meaningful and those readings are left for the graph.
+ *
+ * DROP_ALERT_THRESHOLD / RISE_THRESHOLD (8 L) survive as the cap in
+ * eventToleranceLiters(), not as detection floors.
  */
 export const STATIONARY_EVENT_THRESHOLD = 3.0;
 
@@ -126,25 +128,40 @@ export const STATIONARY_MAX_SPEED_KMH = 5.0;
 export const STATIONARY_SETTLE_MINUTES = 2;
 
 /**
- * Builds a constant-time test for "was the vehicle standing still for this
- * event" over a reading series, given the indices of the pair of readings the
- * event sits between.
+ * Constant-time tests for whether the vehicle was standing still, over one
+ * reading series.
  *
- * An event counts as stationary when neither of its two readings, nor any
- * reading in the STATIONARY_SETTLE_MINUTES before them, was moving. The
- * settling margin matters because fuel keeps sloshing after a vehicle stops
- * and the level settles by several litres — without it, every stop would
- * manufacture a 3 L "drop" or "refuel".
+ * A fuel sensor is only trustworthy on a stationary vehicle: in motion slosh
+ * swings the same sensor 10-15 L between consecutive readings. Every reported
+ * figure — levels, drops, refuels — is therefore taken at rest, and moving
+ * readings are left for the graph alone.
  *
- * Built once per series rather than rescanning the window per event: the
- * analysis walk visits every reading, so a scan each time is quadratic and
- * unusable over a month of 1-minute data (~45k readings).
+ * "At rest" means the reading itself is under the speed gate AND nothing in
+ * the STATIONARY_SETTLE_MINUTES before it was moving. The settling margin
+ * matters because fuel keeps sloshing after a vehicle stops and the level
+ * settles by several litres; without it, every stop would manufacture a drop
+ * or a refuel.
+ *
+ * Built once per series rather than rescanning per reading: the analysis walk
+ * visits every reading, so a scan each time is quadratic and unusable over a
+ * month of 1-minute data (~45k readings).
  */
-export function stationaryEventTester(
+export interface StationaryTester {
+  /** True when reading `index` is at rest and has settled. */
+  isSettled(index: number): boolean;
+  /**
+   * True when the vehicle stood still across a pair of readings — from the
+   * settling margin before `prevIndex` through `currIndex` — so the change
+   * between them is a real fuel movement rather than slosh.
+   */
+  spansRest(prevIndex: number, currIndex: number): boolean;
+}
+
+export function stationaryTester(
   readings: FuelReading[],
   maxSpeedKmh: number = STATIONARY_MAX_SPEED_KMH,
   settleMinutes: number = STATIONARY_SETTLE_MINUTES,
-): (prevIndex: number, currIndex: number) => boolean {
+): StationaryTester {
   const settleMs = settleMinutes * 60 * 1000;
 
   // lastMovingMs[i] = timestamp of the newest reading at or before i where the
@@ -158,20 +175,67 @@ export function stationaryEventTester(
     lastMovingMs[i] = newestMoving;
   }
 
-  return (prevIndex: number, currIndex: number): boolean => {
-    if (
-      prevIndex < 0 ||
-      currIndex < 0 ||
-      prevIndex >= readings.length ||
-      currIndex >= readings.length
-    ) {
-      return false;
-    }
+  const inRange = (index: number): boolean =>
+    index >= 0 && index < readings.length;
 
-    const windowStart = readings[prevIndex].ts.getTime() - settleMs;
-    const moving = lastMovingMs[currIndex];
+  const restingSince = (index: number, windowStart: number): boolean => {
+    const moving = lastMovingMs[index];
     return moving === null || moving < windowStart;
   };
+
+  return {
+    isSettled(index: number): boolean {
+      if (!inRange(index)) return false;
+      return restingSince(index, readings[index].ts.getTime() - settleMs);
+    },
+
+    spansRest(prevIndex: number, currIndex: number): boolean {
+      if (!inRange(prevIndex) || !inRange(currIndex)) return false;
+      return restingSince(
+        currIndex,
+        readings[prevIndex].ts.getTime() - settleMs,
+      );
+    },
+  };
+}
+
+/**
+ * Index of the reading where a change reported by the median filter actually
+ * happened.
+ *
+ * A causal median filter only reports a step once it reaches the middle of its
+ * window, so a change shows up two or three readings after the fact. Asking
+ * whether the vehicle was standing still at the reported index therefore asks
+ * about the wrong moment — and a GPS speed spike landing in those few seconds
+ * hides a real parked siphon, while the sensor was in fact steady at zero when
+ * the fuel actually went.
+ *
+ * Returns the index j whose step from j-1 is the largest in `direction` within
+ * the filter's reach, so callers can judge stillness across the readings that
+ * produced the change. Falls back to `reportedIndex` when nothing moved that
+ * way.
+ */
+export function rawChangeIndex(
+  raw: FuelReading[],
+  reportedIndex: number,
+  direction: 'drop' | 'rise',
+  lookback: number = FUEL_MEDIAN_SAMPLES - 1,
+): number {
+  const sign = direction === 'drop' ? -1 : 1;
+  const start = Math.max(1, reportedIndex - lookback);
+
+  let bestIndex = reportedIndex;
+  let bestStep = 0;
+
+  for (let j = start; j <= reportedIndex && j < raw.length; j++) {
+    const step = (raw[j].fuel - raw[j - 1].fuel) * sign;
+    if (step > bestStep) {
+      bestStep = step;
+      bestIndex = j;
+    }
+  }
+
+  return bestIndex;
 }
 
 /**
@@ -179,11 +243,11 @@ export function stationaryEventTester(
  * magnitude — the scale the fake-spike / fake-rise / fall-back checks measure
  * recovery against.
  *
- * Distinct from minEventLiters(), which decides whether a change qualifies as
- * an event at all. Feeding the 3 L stationary floor into the validation checks
- * instead breaks them: their "did it stay down / stay up" tests scan for the
- * first sub-move at or above the scale given, so a small scale latches onto
- * sensor noise and rejects genuine large events.
+ * Distinct from STATIONARY_EVENT_THRESHOLD, which decides whether a change
+ * qualifies as an event at all. Feeding that 3 L floor into the validation
+ * checks instead breaks them: their "did it stay down / stay up" tests scan
+ * for the first sub-move at or above the scale given, so a small scale latches
+ * onto sensor noise and rejects genuine large events.
  *
  * At or above `cap` the event gets the full tolerance, exactly as before this
  * function existed. Below it — only reachable now that stationary events as
@@ -197,17 +261,6 @@ export function eventToleranceLiters(
 ): number {
   const size = Math.max(0, magnitude);
   return size >= cap ? cap : size * RISE_RETENTION_FRACTION;
-}
-
-/**
- * Minimum litres for a drop/rise to count as a real event: 3 L standing
- * still, `movingThreshold` (8 L) in motion.
- */
-export function minEventLiters(
-  stationary: boolean,
-  movingThreshold: number,
-): number {
-  return stationary ? STATIONARY_EVENT_THRESHOLD : movingThreshold;
 }
 
 // ─── Typed row ────────────────────────────────────────────────────────────────

@@ -24,11 +24,13 @@ export const DROP_THRESHOLD = 8.0;
 export const RISE_THRESHOLD = 8.0;
 
 /**
- * Minimum fuel drop/rise to trigger an alert while the vehicle is STATIONARY
- * (liters). Parked, the sensor is steady to a few tenths of a litre, so 3 L is
- * already a real event — a small siphon or a small top-up. Moving, fuel slosh
- * swings the same sensor by 10-15 L between readings, which is why
- * DROP_THRESHOLD / RISE_THRESHOLD (8 L) still apply in motion.
+ * Minimum fuel drop/rise to trigger an alert (liters).
+ *
+ * Events are only ever read off a stationary vehicle, where the sensor is
+ * steady to a few tenths of a litre, so 3 L is already a real event — a small
+ * siphon or a small top-up. In motion the same sensor swings 10-15 L on slosh
+ * alone, so no threshold makes a moving reading meaningful and those readings
+ * are left for the graph.
  *
  * Mirrors STATIONARY_EVENT_THRESHOLD in the backend's fuel-drop-filter.util.ts.
  */
@@ -42,15 +44,12 @@ export const STATIONARY_EVENT_THRESHOLD = 3.0;
 export const STATIONARY_MAX_SPEED_KMH = 5.0;
 
 /**
- * Minimum litres for a drop/rise to count: 3 L standing still, the moving
- * threshold otherwise.
+ * Minutes of stillness required before a reading can be trusted. Fuel keeps
+ * sloshing after a vehicle stops and the level settles by several litres.
+ *
+ * Mirrors STATIONARY_SETTLE_MINUTES in the backend's fuel-drop-filter.util.ts.
  */
-export function minEventLiters(
-  stationary: boolean,
-  movingThreshold: number
-): number {
-  return stationary ? STATIONARY_EVENT_THRESHOLD : movingThreshold;
-}
+export const STATIONARY_SETTLE_MINUTES = 2;
 
 /** Low fuel warning threshold (liters) */
 export const LOW_FUEL_THRESHOLD = 50.0;
@@ -266,17 +265,17 @@ export class FuelDetector {
         const drop = this.lastFuelValue - filteredFuel;
         const rise = filteredFuel - this.lastFuelValue;
 
-        // A parked vehicle's sensor is steady, so 3 L is already a real event;
-        // in motion, slosh needs the full 8 L. Both this reading and the one
-        // before it must be at rest — fuel keeps settling for a while after a
-        // stop, and that settling must not manufacture events.
-        const stationary =
-          reading.speed <= STATIONARY_MAX_SPEED_KMH &&
-          (this.history[this.history.length - 2]?.speed ??
-            reading.speed) <= STATIONARY_MAX_SPEED_KMH;
+        // Events are read only off a vehicle standing still — in motion the
+        // sensor swings 10-15 L on slosh alone, so a change measured there
+        // says nothing about the tank. Those readings still reach the graph.
+        if (!this.hasBeenAtRest(reading)) {
+          this.lastFuelValue = filteredFuel;
+          this.lastReadingTime = reading.timestamp;
+          return { dropResult, riseResult, alert };
+        }
 
         // Check for drop
-        if (drop >= minEventLiters(stationary, DROP_THRESHOLD)) {
+        if (drop >= STATIONARY_EVENT_THRESHOLD) {
           dropResult = this.checkDrop(
             this.lastFuelValue,
             filteredFuel,
@@ -291,7 +290,7 @@ export class FuelDetector {
         }
 
         // Check for rise
-        if (rise >= minEventLiters(stationary, RISE_THRESHOLD)) {
+        if (rise >= STATIONARY_EVENT_THRESHOLD) {
           riseResult = this.checkRise(this.lastFuelValue, filteredFuel, reading);
 
           if (riseResult.isRise && !riseResult.isFakeSpike && !this.isProcessingRise) {
@@ -502,6 +501,31 @@ export class FuelDetector {
     }
 
     return false;
+  }
+
+  /**
+   * True when this reading can be trusted as a fuel level: the vehicle is
+   * standing still and has been for STATIONARY_SETTLE_MINUTES.
+   *
+   * The settling margin matters because fuel keeps sloshing after a vehicle
+   * stops and the level settles by several litres — without it, every stop
+   * would manufacture a drop or a refuel.
+   *
+   * Mirrors stationaryTester().isSettled() in the backend's
+   * fuel-drop-filter.util.ts.
+   */
+  private hasBeenAtRest(reading: FuelReading): boolean {
+    if (reading.speed > STATIONARY_MAX_SPEED_KMH) return false;
+
+    const settleStart =
+      reading.timestamp.getTime() - STATIONARY_SETTLE_MINUTES * 60 * 1000;
+
+    return this.history.every(
+      (r) =>
+        r.timestamp.getTime() < settleStart ||
+        r.timestamp > reading.timestamp ||
+        r.speed <= STATIONARY_MAX_SPEED_KMH
+    );
   }
 
   /**
@@ -774,16 +798,15 @@ export function detectDropsFromHistory(
     // Skip if not a drop
     if (consumed <= 0) continue;
 
+    // Events are read only off a vehicle standing still; a change measured in
+    // motion is slosh. Those buckets still appear on the graph.
+    if (!bucketsStationary(prev, curr)) continue;
+
     // Check for sensor jump (>2L single reading)
     // NOTE: In aggregated data, this might not work well - rely on other checks
     const isSensorJump = consumed > MILEAGE_MAX_LITER_DROP_PER_READING * 3; // Relaxed for aggregated data
 
-    // 3 L standing still, 8 L in motion — matches the backend.
-    const dropThreshold = minEventLiters(
-      bucketsStationary(prev, curr),
-      DROP_THRESHOLD
-    );
-    const meetsThreshold = consumed >= dropThreshold;
+    const meetsThreshold = consumed >= STATIONARY_EVENT_THRESHOLD;
 
     // Check if it's a confirmed drop (not a spike)
     let isConfirmedDrop = false;
@@ -795,7 +818,7 @@ export function detectDropsFromHistory(
 
       for (let j = i + 1; j < windowEnd; j++) {
         // If fuel recovered close to the original level, it's a spike/fake
-        if (buckets[j].fuel >= fuelBefore - dropThreshold) {
+        if (buckets[j].fuel >= fuelBefore - STATIONARY_EVENT_THRESHOLD) {
           recovered = true;
           break;
         }
@@ -844,15 +867,18 @@ export function detectDropsFromHistory(
       j++;
     }
 
-    // Stationary only if the whole run was at rest — a cumulative drop that
-    // spans a departure is driving consumption, not a siphon.
+    // The whole run must have been at rest — a cumulative drop that spans a
+    // departure is driving consumption, not a siphon.
     const runStationary = buckets
       .slice(i, Math.max(i + 1, lowestIndex + 1))
       .every((b) => b.speed != null && b.speed <= STATIONARY_MAX_SPEED_KMH);
-    const cumulativeThreshold = minEventLiters(runStationary, DROP_THRESHOLD);
 
     // If cumulative drop meets threshold and spans multiple buckets, add as a single drop
-    if (cumulativeDrop >= cumulativeThreshold && lowestIndex > i + 1) {
+    if (
+      runStationary &&
+      cumulativeDrop >= STATIONARY_EVENT_THRESHOLD &&
+      lowestIndex > i + 1
+    ) {
       // Check if this cumulative drop is already captured
       const alreadyCaptured = drops.some(
         (d) => Math.abs(new Date(d.at).getTime() - new Date(buckets[lowestIndex].dt).getTime()) < 60000
@@ -863,7 +889,7 @@ export function detectDropsFromHistory(
         const recoveryWindow = Math.min(lowestIndex + 4, buckets.length);
         let recovered = false;
         for (let k = lowestIndex + 1; k < recoveryWindow; k++) {
-          if (buckets[k].fuel >= startBucket.fuel - cumulativeThreshold) {
+          if (buckets[k].fuel >= startBucket.fuel - STATIONARY_EVENT_THRESHOLD) {
             recovered = true;
             break;
           }
@@ -920,8 +946,11 @@ export function detectRefuelsFromHistory(buckets: FuelBucket[]): FuelRefuelDetai
     // Skip if not a rise
     if (added <= 0) continue;
 
-    // Only include if meets threshold — 3 L standing still, 8 L in motion.
-    if (added >= minEventLiters(bucketsStationary(prev, curr), RISE_THRESHOLD)) {
+    // Only off a vehicle standing still, and only from 3 L up.
+    if (
+      bucketsStationary(prev, curr) &&
+      added >= STATIONARY_EVENT_THRESHOLD
+    ) {
       refuels.push({
         at: curr.dt,
         fuelBefore,

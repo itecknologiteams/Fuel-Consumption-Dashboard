@@ -1,6 +1,10 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
+import {
+  STATIONARY_MAX_SPEED_KMH,
+  STATIONARY_SETTLE_MINUTES,
+} from './fuel-drop-filter.util';
 
 export interface DataRow {
   dt_tracker: Date;
@@ -72,6 +76,98 @@ export class DynamicTableQueryService {
   }
 
   /**
+   * The newest reading taken with the vehicle standing still — the last
+   * trustworthy fuel level.
+   *
+   * A level read in motion is worth ±15 L of slosh, so "current fuel" has to
+   * come from a reading at rest even when that means reaching back to before
+   * the vehicle set off. At rest means under `maxSpeedKmh` with nothing moving
+   * in the `settleSeconds` before it, because fuel keeps sloshing for a while
+   * after a stop.
+   *
+   * Runs as a narrow scan of timestamps and speeds, then one fetch of the row
+   * that wins. Expressing the settling rule as a correlated NOT EXISTS instead
+   * measured 8-14 s per vehicle on a busy tracker — unusable in the dashboard's
+   * per-vehicle loop, where this costs ~35 ms.
+   *
+   * Returns null when the vehicle has not stood still within the scanned
+   * window; callers fall back to the reading as taken.
+   */
+  async getLatestStationaryRow(
+    imei: string,
+    maxSpeedKmh: number,
+    settleSeconds: number,
+    lookbackHours = 24,
+    maxScanRows = 2000,
+  ): Promise<DataRow | null> {
+    await this.assertTableExists(imei);
+    const tableName = this.getTableName(imei);
+    const since = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
+
+    const recent: Array<{ dt_tracker: Date; speed: number }> =
+      await this.dataSource.query(
+        `SELECT dt_tracker, speed
+         FROM \`${tableName}\`
+         WHERE dt_tracker >= ?
+         ORDER BY dt_tracker DESC
+         LIMIT ?`,
+        [since, maxScanRows],
+      );
+
+    if (!recent.length) return null;
+
+    // Oldest → newest so the settling margin can be applied as we go.
+    const settleMs = settleSeconds * 1000;
+    let lastMovingMs: number | null = null;
+    let settledAt: Date | null = null;
+
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const ts = new Date(recent[i].dt_tracker);
+      const tsMs = ts.getTime();
+
+      if (recent[i].speed > maxSpeedKmh) {
+        lastMovingMs = tsMs;
+      } else if (lastMovingMs === null || lastMovingMs < tsMs - settleMs) {
+        settledAt = ts;
+      }
+    }
+
+    if (!settledAt) return null;
+
+    const rows: DataRow[] = await this.dataSource.query(
+      `SELECT dt_tracker, dt_server, lat, lng, speed, params
+       FROM \`${tableName}\`
+       WHERE dt_tracker = ?
+       LIMIT 1`,
+      [settledAt],
+    );
+
+    return rows[0] ?? null;
+  }
+
+  /**
+   * The reading a fuel level should be quoted from.
+   *
+   * Prefers the newest reading taken at rest, because a level sampled in
+   * motion is worth ±15 L of slosh. Falls back to the newest reading as taken
+   * when the vehicle has not stood still recently — a rough level beats a
+   * blank gauge.
+   */
+  async getLatestRestingRow(imei: string): Promise<DataRow | null> {
+    const resting = await this.getLatestStationaryRow(
+      imei,
+      STATIONARY_MAX_SPEED_KMH,
+      STATIONARY_SETTLE_MINUTES * 60,
+    );
+    if (resting) return resting;
+
+    this.logger.debug(
+      `IMEI ${imei}: no stationary reading in the recent window — quoting the fuel level as taken`,
+    );
+    return this.getLatestRow(imei);
+  }
+
+  /**
    * Range fetch, forcing the dt_tracker index. For wide ranges MySQL's
    * optimizer otherwise picks a full table scan + filesort (measured ~2x
    * slower than the index range scan). Falls back to an unhinted query if a
@@ -86,15 +182,15 @@ export class DynamicTableQueryService {
     const tail =
       'WHERE dt_tracker >= ? AND dt_tracker <= ? ORDER BY dt_tracker ASC LIMIT ?';
     try {
-      return (await this.dataSource.query(
+      return await this.dataSource.query(
         `SELECT ${cols} FROM \`${tableName}\` FORCE INDEX (dt_tracker) ${tail}`,
         [from, to, MAX_ROWS],
-      )) as DataRow[];
+      );
     } catch {
-      return (await this.dataSource.query(
+      return await this.dataSource.query(
         `SELECT ${cols} FROM \`${tableName}\` ${tail}`,
         [from, to, MAX_ROWS],
-      )) as DataRow[];
+      );
     }
   }
 
@@ -158,9 +254,9 @@ export class DynamicTableQueryService {
     if (!exists) return null;
 
     const tableName = this.getTableName(imei);
-    const windowMs  = windowMinutes * 60 * 1000;
-    const fromTs    = new Date(targetTs.getTime() - windowMs);
-    const toTs      = new Date(targetTs.getTime() + windowMs);
+    const windowMs = windowMinutes * 60 * 1000;
+    const fromTs = new Date(targetTs.getTime() - windowMs);
+    const toTs = new Date(targetTs.getTime() + windowMs);
 
     const rows: Array<{ lat: number; lng: number; dt_tracker: Date }> =
       await this.dataSource.query(

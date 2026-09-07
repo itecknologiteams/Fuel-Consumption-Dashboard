@@ -8,10 +8,10 @@ import { FuelSensor } from './fuel-sensor-resolver.service';
 import { FuelTransformService } from './fuel-transform.service';
 
 /**
- * A 3 L change is a real event on a parked vehicle but noise on a moving one,
- * so the detection floor has to depend on speed. These drive the real
- * analysis over synthetic readings: a 4 L step is either found or ignored
- * purely on the strength of the speed recorded alongside it.
+ * A fuel sensor is only trustworthy on a stationary vehicle — in motion slosh
+ * swings it 10-15 L between readings — so every reported figure is taken at
+ * rest and moving readings are left for the graph. These drive the real
+ * analysis over synthetic readings to pin that down end to end.
  */
 
 const IMEI = '000000000000001';
@@ -28,110 +28,184 @@ const SENSOR: FuelSensor = {
   calibration: [],
 };
 
+interface Segment {
+  /** How many one-minute readings this segment contributes. */
+  minutes: number;
+  fuel: number;
+  speed: number;
+}
+
+const ORIGIN = new Date('2026-03-01T10:00:00.000Z');
+
 /**
- * One reading per minute spanning [-30 min, +45 min] around `stepAt`, at
- * `before` litres until the step and `after` litres from then on.
+ * One reading per minute across the given segments. The first 10 minutes sit
+ * before `from` so they only prime the median filter, exactly as a real query
+ * behaves.
  */
-function buildRows(opts: { before: number; after: number; speed: number }): {
+function buildRows(segments: Segment[]): {
   rows: DataRow[];
   from: Date;
   to: Date;
-  stepAt: Date;
 } {
-  const origin = new Date('2026-03-01T10:00:00.000Z');
-  const stepAt = new Date(origin.getTime() + 30 * 60_000);
   const rows: DataRow[] = [];
+  let minute = 0;
 
-  for (let minute = 0; minute <= 75; minute++) {
-    const ts = new Date(origin.getTime() + minute * 60_000);
-    const fuel = ts >= stepAt ? opts.after : opts.before;
-    rows.push({
-      dt_tracker: ts,
-      dt_server: ts,
-      lat: 0,
-      lng: 0,
-      speed: opts.speed,
-      params: JSON.stringify({ fuel: String(fuel) }),
-    });
+  for (const segment of segments) {
+    for (let n = 0; n < segment.minutes; n++, minute++) {
+      const ts = new Date(ORIGIN.getTime() + minute * 60_000);
+      rows.push({
+        dt_tracker: ts,
+        dt_server: ts,
+        lat: 0,
+        lng: 0,
+        speed: segment.speed,
+        params: JSON.stringify({ fuel: String(segment.fuel) }),
+      });
+    }
   }
 
-  // `from` starts after the warm-up readings so they only prime the median
-  // filter, exactly as a real query behaves.
   return {
     rows,
-    from: new Date(origin.getTime() + 10 * 60_000),
+    from: new Date(ORIGIN.getTime() + 10 * 60_000),
     to: rows[rows.length - 1].dt_tracker,
-    stepAt,
   };
 }
 
-function buildService(rows: DataRow[]): FuelConsumptionService {
+async function analyse(segments: Segment[]) {
+  const { rows, from, to } = buildRows(segments);
   const dynQuery = {
     getRowsInRange: jest.fn().mockResolvedValue(rows),
   } as unknown as DynamicTableQueryService;
 
-  return new FuelConsumptionService(
+  const service = new FuelConsumptionService(
     new FuelTransformService(),
     dynQuery,
     {} as DataSource, // only used by getPythonAlerts, not by getConsumption
   );
-}
 
-async function analyse(opts: { before: number; after: number; speed: number }) {
-  const { rows, from, to } = buildRows(opts);
-  const service = buildService(rows);
   return service.getConsumption(IMEI, from, to, SENSOR, '');
 }
 
-describe('stationary event threshold (3 L parked / 8 L moving)', () => {
-  it('reports a 4 L drop as a confirmed drop while parked', async () => {
-    const result = await analyse({ before: 100, after: 96, speed: 0 });
+const PARKED = 0;
+const DRIVING = 50;
+
+describe('fuel events are read only off a stationary vehicle', () => {
+  it('reports a 4 L drop while parked', async () => {
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: PARKED },
+      { minutes: 45, fuel: 96, speed: PARKED },
+    ]);
 
     const confirmed = result.drops.filter((d) => d.isConfirmedDrop);
     expect(confirmed).toHaveLength(1);
     expect(confirmed[0].consumed).toBeCloseTo(4, 1);
   });
 
-  it('ignores the same 4 L drop while moving', async () => {
-    const result = await analyse({ before: 100, after: 96, speed: 50 });
+  it('raises no event for the same 4 L change while moving', async () => {
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: DRIVING },
+      { minutes: 45, fuel: 96, speed: DRIVING },
+    ]);
 
-    expect(result.drops.filter((d) => d.isConfirmedDrop)).toHaveLength(0);
-    // Below the moving floor it stays a sub-threshold single-reading jump and
-    // never reaches the consumption total.
-    expect(result.consumed).toBe(0);
+    expect(result.drops).toHaveLength(0);
   });
 
-  it('still counts an 11 L drop while moving', async () => {
-    const result = await analyse({ before: 100, after: 89, speed: 50 });
+  it('raises no event for an 11 L change while moving', async () => {
+    // Well over the old 8 L bar, but a moving reading says nothing about the
+    // tank however large the swing.
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: DRIVING },
+      { minutes: 45, fuel: 89, speed: DRIVING },
+    ]);
 
-    // Over the 8 L moving floor, so it is analysed as an event and counted.
-    // It is not a CONFIRMED drop — a drop with the vehicle driving throughout
-    // is consumption, not theft, and isFakeSpike's movement veto says so.
-    expect(result.consumed).toBeCloseTo(11, 1);
-    expect(result.drops.filter((d) => d.isConfirmedDrop)).toHaveLength(0);
+    expect(result.drops).toHaveLength(0);
   });
 
-  it('reports a 4 L rise as a refuel while parked', async () => {
-    const result = await analyse({ before: 100, after: 104, speed: 0 });
+  it('reports a 4 L refuel while parked', async () => {
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: PARKED },
+      { minutes: 45, fuel: 104, speed: PARKED },
+    ]);
 
     expect(result.refuels).toHaveLength(1);
     expect(result.refuels[0].added).toBeCloseTo(4, 1);
     expect(result.refueled).toBeCloseTo(4, 1);
   });
 
-  it('ignores the same 4 L rise while moving', async () => {
-    const result = await analyse({ before: 100, after: 104, speed: 50 });
+  it('raises no refuel for the same 4 L rise while moving', async () => {
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: DRIVING },
+      { minutes: 45, fuel: 104, speed: DRIVING },
+    ]);
 
     expect(result.refuels).toHaveLength(0);
     expect(result.refueled).toBe(0);
   });
 
   it('records the peak time on a refuel so post-fill checks can anchor there', async () => {
-    const result = await analyse({ before: 100, after: 104, speed: 0 });
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: PARKED },
+      { minutes: 45, fuel: 104, speed: PARKED },
+    ]);
 
     expect(result.refuels[0].peakAt).toBeDefined();
     expect(
       new Date(result.refuels[0].peakAt as string).getTime(),
     ).toBeGreaterThanOrEqual(new Date(result.refuels[0].at).getTime());
+  });
+});
+
+describe('consumption is measured stop to stop', () => {
+  it("counts a trip's burn as the fall between the stops either side of it", async () => {
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: PARKED }, // stop before the trip
+      { minutes: 20, fuel: 85, speed: DRIVING }, // driving — sensor untrusted
+      { minutes: 30, fuel: 60, speed: PARKED }, // stop after the trip
+    ]);
+
+    // 40 L burned on the trip, even though no drop EVENT was raised for it.
+    expect(result.consumed).toBeCloseTo(40, 0);
+    expect(result.drops).toHaveLength(0);
+  });
+
+  it('leaves slosh out of the total', async () => {
+    // The vehicle burns nothing, but the sensor swings 15 L while moving.
+    const result = await analyse([
+      { minutes: 20, fuel: 100, speed: PARKED },
+      { minutes: 5, fuel: 85, speed: DRIVING },
+      { minutes: 5, fuel: 115, speed: DRIVING },
+      { minutes: 5, fuel: 88, speed: DRIVING },
+      { minutes: 30, fuel: 100, speed: PARKED },
+    ]);
+
+    expect(result.consumed).toBe(0);
+    expect(result.drops).toHaveLength(0);
+    expect(result.refuels).toHaveLength(0);
+  });
+});
+
+describe('reported levels are taken at rest', () => {
+  it('ignores a sloshed boundary reading in favour of a parked one', async () => {
+    const result = await analyse([
+      { minutes: 20, fuel: 70, speed: DRIVING }, // sloshed low at the boundary
+      { minutes: 40, fuel: 100, speed: PARKED }, // the vehicle's real level
+    ]);
+
+    expect(result.firstFuel).toBeCloseTo(100, 0);
+    expect(result.lastFuel).toBeCloseTo(100, 0);
+    expect(result.netDrop).toBe(0);
+  });
+
+  it('falls back to the readings as taken when the vehicle never stopped', async () => {
+    const result = await analyse([
+      { minutes: 30, fuel: 100, speed: DRIVING },
+      { minutes: 45, fuel: 89, speed: DRIVING },
+    ]);
+
+    // No rest point exists, so the boundary readings stand in and the change
+    // still reaches the period total through the mass balance.
+    expect(result.firstFuel).toBeCloseTo(100, 0);
+    expect(result.lastFuel).toBeCloseTo(89, 0);
+    expect(result.netDrop).toBeCloseTo(11, 0);
   });
 });

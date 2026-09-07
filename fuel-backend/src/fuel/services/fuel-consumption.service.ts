@@ -15,15 +15,16 @@ import {
   isRecoveryRise,
   isPostRefuelFallback,
   DROP_ALERT_THRESHOLD,
-  RISE_THRESHOLD,
   SPIKE_WINDOW_MINUTES,
   FUEL_MEDIAN_SAMPLES,
   REFUEL_CONSOLIDATION_MINUTES,
   POST_REFUEL_VERIFY_EPS_LITERS,
   RISE_RECOVERY_LOOKBACK_MINUTES,
   eventToleranceLiters,
-  minEventLiters,
-  stationaryEventTester,
+  STATIONARY_EVENT_THRESHOLD,
+  StationaryTester,
+  rawChangeIndex,
+  stationaryTester,
 } from './fuel-drop-filter.util';
 
 /**
@@ -287,6 +288,8 @@ export class FuelConsumptionService {
       drops: allDrops,
       refuels: allRefuels,
       readings,
+      filtered,
+      atRest,
     } = this.analyzeRows(allRows, sensor, imei);
 
     // Filter events to only those that fall within the actual requested range.
@@ -294,19 +297,38 @@ export class FuelConsumptionService {
     const drops = allDrops.filter((d) => d.at >= fromIso);
     const refuels = allRefuels.filter((r) => r.at >= fromIso);
 
-    // firstFuel / lastFuel must reflect the actual [from, to] period, not the warmup.
-    const actualReadings = readings.filter((r) => r.ts >= from);
-    const firstFuel = actualReadings.length > 0 ? actualReadings[0].fuel : null;
+    // Indices of the readings inside [from, to] — the warmup only exists to
+    // prime the median filter and must not contribute figures.
+    const periodIndices: number[] = [];
+    for (let i = 0; i < filtered.length; i++) {
+      if (filtered[i].ts >= from) periodIndices.push(i);
+    }
+    const restIndices = periodIndices.filter((i) => atRest.isSettled(i));
+
+    // Every reported level is read off a stationary vehicle. A level sampled
+    // in motion is worth ±15 L of slosh, which lands straight in netDrop and
+    // from there in "Total Fuel Used" and its cost.
+    //
+    // Fall back to the plain boundary readings when the vehicle never stopped
+    // inside the period: a rough figure beats a blank one, and the log below
+    // records that it is the weaker kind.
+    const levelIndices = restIndices.length > 0 ? restIndices : periodIndices;
+    const firstFuel =
+      levelIndices.length > 0 ? filtered[levelIndices[0]].fuel : null;
     const lastFuel =
-      actualReadings.length > 0
-        ? actualReadings[actualReadings.length - 1].fuel
+      levelIndices.length > 0
+        ? filtered[levelIndices[levelIndices.length - 1]].fuel
         : null;
 
-    // Exclude sensor-jump drops from the consumed total (mirrors Python's
-    // MILEAGE_MAX_LITER_DROP_PER_READING filter on consumed_liters).
-    const consumed = drops
-      .filter((d) => !d.isSensorJump)
-      .reduce((sum, d) => sum + d.consumed, 0);
+    if (restIndices.length === 0 && periodIndices.length > 0) {
+      this.logger.warn(
+        `IMEI ${imei}: no stationary reading between ${fromIso} and ` +
+          `${to.toISOString()} — levels fall back to the readings as taken, ` +
+          `which carry motion noise`,
+      );
+    }
+
+    const consumed = this.restToRestConsumed(filtered, restIndices);
     const refueled = refuels.reduce((sum, r) => sum + r.added, 0);
     const pricePerLiter = this.extractPricePerLiter(fcrJson, from);
 
@@ -344,7 +366,7 @@ export class FuelConsumptionService {
       estimatedCost,
       unit: sensor.units || 'L',
       refuelEvents: refuels.length,
-      samples: actualReadings.length,
+      samples: periodIndices.length,
       refuels,
       drops,
       firstFuel: firstFuel !== null ? Math.round(firstFuel * 100) / 100 : null,
@@ -354,6 +376,33 @@ export class FuelConsumptionService {
     };
   }
 
+  /**
+   * Fuel burned over the period, measured stop to stop: the level at each rest
+   * point minus the level at the next, summed over every fall.
+   *
+   * Only readings taken at rest are used, so slosh never enters the total —
+   * and a trip's burn is still counted in full, as the fall between the stop
+   * before it and the stop after it. Rises are refuels and are skipped.
+   */
+  private restToRestConsumed(
+    filtered: FuelReading[],
+    restIndices: number[],
+  ): number {
+    let consumed = 0;
+    let previousLevel: number | null = null;
+
+    for (const index of restIndices) {
+      const level = filtered[index].fuel;
+      if (previousLevel !== null) {
+        const fall = previousLevel - level;
+        if (fall > NOISE_THRESHOLD) consumed += fall;
+      }
+      previousLevel = level;
+    }
+
+    return consumed;
+  }
+
   private analyzeRows(
     rows: DataRow[],
     sensor: FuelSensor,
@@ -361,9 +410,10 @@ export class FuelConsumptionService {
   ): {
     drops: DropEvent[];
     refuels: RefuelEvent[];
-    firstFuel: number | null;
-    lastFuel: number | null;
     readings: FuelReading[];
+    /** Median-filtered series, index-aligned with `readings`. */
+    filtered: FuelReading[];
+    atRest: StationaryTester;
   } {
     // ── Step 1: transform every row ──────────────────────────────────────────
     const raw: FuelReading[] = [];
@@ -391,20 +441,14 @@ export class FuelConsumptionService {
 
     // Speeds come from the unfiltered readings; the median filter maps 1:1 so
     // the two arrays share indices.
-    const isStationaryEvent = stationaryEventTester(raw);
+    const atRest = stationaryTester(raw);
 
     const drops: DropEvent[] = [];
     const refuels: RefuelEvent[] = [];
-    let firstFuel: number | null = null;
-    let lastFuel: number | null = null;
-
     // ── Step 2: index-based walk so we can skip forward after consolidation ──
     let i = 0;
     while (i < transformed.length) {
-      const { ts, fuel } = transformed[i];
-
-      if (firstFuel === null) firstFuel = fuel;
-      lastFuel = fuel;
+      const { fuel } = transformed[i];
 
       if (i === 0) {
         i++;
@@ -415,12 +459,25 @@ export class FuelConsumptionService {
       const delta = fuel - prev.fuel;
       const singleConsumed = Math.abs(delta);
 
-      // A parked vehicle's sensor is steady, so a 3 L change is already a real
-      // event; in motion, slosh needs the full 8 L before a change means
-      // anything. Judged per event over [prev, curr] plus a settling margin.
-      const stationary = isStationaryEvent(i - 1, i);
-      const dropThreshold = minEventLiters(stationary, DROP_ALERT_THRESHOLD);
-      const riseThreshold = minEventLiters(stationary, RISE_THRESHOLD);
+      // Fuel events are read ONLY off a vehicle standing still. In motion the
+      // sensor swings 10-15 L on slosh alone, so a change measured there says
+      // nothing about the tank — those readings are left for the graph. What
+      // the vehicle burns while driving is not lost: it shows up as the fall
+      // between the stop before the trip and the stop after it, which is how
+      // restToRestConsumed() measures consumption.
+      //
+      // Judged at the raw reading that produced the change, not at the index
+      // the median filter reported it on — see rawChangeIndex().
+      const changeAt = rawChangeIndex(raw, i, delta < 0 ? 'drop' : 'rise');
+      if (!atRest.spansRest(changeAt - 1, changeAt)) {
+        i++;
+        continue;
+      }
+
+      // Standing still the sensor is steady to a few tenths of a litre, so a
+      // 3 L change is already a real event.
+      const dropThreshold = STATIONARY_EVENT_THRESHOLD;
+      const riseThreshold = STATIONARY_EVENT_THRESHOLD;
 
       if (delta < -NOISE_THRESHOLD) {
         if (singleConsumed >= dropThreshold) {
@@ -487,8 +544,8 @@ export class FuelConsumptionService {
           this.logger.log(
             `[DROP] IMEI ${imei} at ${transformed[i].ts.toISOString()}: ` +
               `baseline=${baselineFuel.toFixed(2)} verified=${verifiedFuel.toFixed(2)} ` +
-              `consumed=${totalConsumed.toFixed(2)} stationary=${stationary} ` +
-              `minLiters=${dropThreshold} verifyPassed=${verifyPassed} fake=${fake} ` +
+              `consumed=${totalConsumed.toFixed(2)} minLiters=${dropThreshold} ` +
+              `verifyPassed=${verifyPassed} fake=${fake} ` +
               `postRecovery=${postRecovery} → confirmed=${isConfirmedDrop}`,
           );
 
@@ -503,8 +560,6 @@ export class FuelConsumptionService {
           });
 
           // Skip past every reading that was merged into this consolidated event.
-          // Update lastFuel to the verified final level.
-          lastFuel = verifiedFuel;
           i = j;
           continue;
         } else {
@@ -641,7 +696,7 @@ export class FuelConsumptionService {
           this.logger.log(
             `[RISE] IMEI ${imei} at ${baselineTs.toISOString()}: ` +
               `added=${totalAdded.toFixed(2)}L peak=${peakFuel.toFixed(2)}L ` +
-              `stationary=${stationary} minLiters=${riseThreshold} ` +
+              `minLiters=${riseThreshold} ` +
               `fakeRise=${fakeRise} recoveryRise=${recoveryRise} postFallback=${postFallback} ` +
               `movementDuringRefuel=${movementDuringRefuel}`,
           );
@@ -671,7 +726,6 @@ export class FuelConsumptionService {
         }
 
         // Skip past the consolidation window (all merged into this one event).
-        lastFuel = transformed[Math.max(i, k - 1)]?.fuel ?? peakFuel;
         i = k;
         continue;
       }
@@ -679,7 +733,7 @@ export class FuelConsumptionService {
       i++;
     }
 
-    return { drops, refuels, firstFuel, lastFuel, readings: raw };
+    return { drops, refuels, readings: raw, filtered: transformed, atRest };
   }
 
   /**

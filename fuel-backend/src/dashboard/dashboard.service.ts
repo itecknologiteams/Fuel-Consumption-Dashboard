@@ -173,7 +173,7 @@ export class DashboardService {
         refueled = result.refueled;
         cost = result.estimatedCost;
 
-        const latestRow = await this.dynQuery.getLatestRow(v.imei);
+        const latestRow = await this.dynQuery.getLatestRestingRow(v.imei);
         if (latestRow) {
           const rawValue = this.transform.extractRawValue(
             latestRow.params,

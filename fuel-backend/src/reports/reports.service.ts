@@ -735,7 +735,7 @@ export class ReportsService {
         try {
           const sensor = await this.sensorResolver.resolveFuelSensor(v.imei);
           fuelUnit = sensor.units || 'L';
-          const latestRow = await this.dynQuery.getLatestRow(v.imei);
+          const latestRow = await this.dynQuery.getLatestRestingRow(v.imei);
           if (latestRow) {
             const ts = new Date(latestRow.dt_tracker).toISOString();
             const rawValue = this.transform.extractRawValue(
