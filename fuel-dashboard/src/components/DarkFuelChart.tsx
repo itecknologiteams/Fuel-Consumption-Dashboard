@@ -56,6 +56,12 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   if (!active || !payload?.length) return null;
   const formatted = fmtDateTime(label);
 
+  // Speed belongs to the reading rather than to any one series, so it is read
+  // off the data point once instead of inside the per-series loop below.
+  // Absent on responses from a backend that predates it on fuel history.
+  const speed = payload[0]?.payload?.speed;
+  const hasSpeed = typeof speed === "number" && Number.isFinite(speed);
+
   return (
     <div style={{
       background: "#FFFFFF", border: "1px solid #DBEAFE",
@@ -76,6 +82,13 @@ const CustomTooltip = ({ active, payload, label }: any) => {
           </div>
         );
       })}
+      {hasSpeed && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#94a3b8", flexShrink: 0, display: "inline-block" }} />
+          <span style={{ color: "var(--color-text-2)" }}>Speed:</span>
+          <span style={{ fontWeight: 700, color: "#475569" }}>{Math.round(speed)} km/h</span>
+        </div>
+      )}
     </div>
   );
 };
