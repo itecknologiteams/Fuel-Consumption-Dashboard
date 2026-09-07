@@ -9,6 +9,13 @@ export interface FuelHistoryPoint {
   dt: string;
   fuel: number | null;
   unit: string;
+  /**
+   * Vehicle speed (km/h) at the reading this bucket was taken from. Carried
+   * through so client-side detection can tell a parked bucket from a moving
+   * one and apply the same stationary/moving event thresholds the backend does
+   * (STATIONARY_EVENT_THRESHOLD vs DROP_ALERT_THRESHOLD).
+   */
+  speed?: number;
 }
 
 export interface FuelHistoryResult {
@@ -119,7 +126,12 @@ export class FuelHistoryService {
       const { value } = this.transform.transform(rawValue, sensor);
       const dtStr = this.formatTimestamp(ts, tz);
 
-      buckets.push({ dt: dtStr, fuel: value, unit: sensor.units || 'L' });
+      buckets.push({
+        dt: dtStr,
+        fuel: value,
+        unit: sensor.units || 'L',
+        speed: row.speed,
+      });
     }
 
     return {

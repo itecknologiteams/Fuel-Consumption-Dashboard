@@ -25,9 +25,9 @@ describe('periodConsumed', () => {
   it('falls back when a detected refuel does not cover the whole rise', () => {
     // e.g. a calibration table that saturates below tank capacity clips the
     // measured fill, leaving the balance non-positive.
-    expect(
-      periodConsumed({ netDrop: -40, refueled: 30, consumed: 90 }),
-    ).toBe(90);
+    expect(periodConsumed({ netDrop: -40, refueled: 30, consumed: 90 })).toBe(
+      90,
+    );
   });
 
   it('reports no burn for an idle vehicle', () => {

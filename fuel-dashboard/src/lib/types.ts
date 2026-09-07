@@ -66,6 +66,12 @@ export interface FuelBucket {
   dt: string;
   fuel: number;
   unit: string;
+  /**
+   * Vehicle speed (km/h) at the reading this bucket was taken from. Lets
+   * client-side detection apply the stationary (3 L) event threshold instead
+   * of the moving (8 L) one. Optional — responses from an older backend omit it.
+   */
+  speed?: number;
 }
 
 export interface FuelHistoryData {

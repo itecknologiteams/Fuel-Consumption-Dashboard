@@ -24,7 +24,11 @@ import {
   SPIKE_WINDOW_MINUTES,
   FUEL_MEDIAN_SAMPLES,
   REFUEL_CONSOLIDATION_MINUTES,
+  RISE_RECOVERY_LOOKBACK_MINUTES,
   POST_REFUEL_VERIFY_EPS_LITERS,
+  eventToleranceLiters,
+  minEventLiters,
+  stationaryEventTester,
 } from './fuel-drop-filter.util';
 
 /**
@@ -254,6 +258,10 @@ export class FuelStatsService {
     }));
     const validRows = applyMedianFilter(fuelReadings, FUEL_MEDIAN_SAMPLES);
 
+    // Speeds come from the unfiltered readings; the median filter maps 1:1 so
+    // the two arrays share indices.
+    const isStationaryEvent = stationaryEventTester(fuelReadings);
+
     let i = 0;
     while (i < validRows.length) {
       if (i === 0) {
@@ -266,9 +274,16 @@ export class FuelStatsService {
       const delta = row.fuel - prev.fuel;
       const singleConsumed = Math.abs(delta);
 
+      // 3 L is a real event on a parked vehicle; in motion, slosh needs the
+      // full 8 L. Mirrors fuel-consumption.service.ts so the stats panel and
+      // the consumption figures agree on what counts as an event.
+      const stationary = isStationaryEvent(i - 1, i);
+      const dropThreshold = minEventLiters(stationary, DROP_ALERT_THRESHOLD);
+      const riseThreshold = minEventLiters(stationary, RISE_THRESHOLD);
+
       if (delta < -NOISE_THRESHOLD) {
-        if (singleConsumed >= DROP_ALERT_THRESHOLD) {
-          // ── Large drop (≥ 8 L): mirrors Python's handle_fuel_drop thread ──────
+        if (singleConsumed >= dropThreshold) {
+          // ── Large drop: mirrors Python's handle_fuel_drop thread ──────────────
           const baselineFuel = prev.fuel;
           const baselineTs = prev.ts;
           const windowEndMs =
@@ -281,13 +296,19 @@ export class FuelStatsService {
             validRows[j].ts.getTime() <= windowEndMs
           ) {
             const nextFuel = validRows[j].fuel;
-            if (nextFuel > baselineFuel - DROP_ALERT_THRESHOLD) break;
+            if (nextFuel > baselineFuel - dropThreshold) break;
             if (nextFuel - verifiedFuel > REFUEL_THRESHOLD) break;
             verifiedFuel = nextFuel;
             j++;
           }
 
           const totalConsumed = baselineFuel - verifiedFuel;
+          // Scale the recovery checks to the drop being validated — see
+          // eventToleranceLiters(); unchanged (8 L) for any drop ≥ 8 L.
+          const dropTolerance = eventToleranceLiters(
+            totalConsumed,
+            DROP_ALERT_THRESHOLD,
+          );
 
           // ── Layer 2: Verify delay + speed gate ────────────────────────────────
           // Mirrors Python: re-read after 80 s, check still dropped >= 8 L AND stationary.
@@ -295,6 +316,7 @@ export class FuelStatsService {
             row.ts, // drop timestamp
             baselineFuel,
             validRows,
+            dropThreshold,
           );
 
           // ── Layer 3: Fake-spike check (includes speed veto) ───────────────────
@@ -304,7 +326,7 @@ export class FuelStatsService {
               baselineTs,
               validRows,
               SPIKE_WINDOW_MINUTES,
-              DROP_ALERT_THRESHOLD,
+              dropTolerance,
             );
 
           // ── Layer 4: Post-drop verify ─────────────────────────────────────────
@@ -318,7 +340,7 @@ export class FuelStatsService {
             );
 
           const isConfirmedDrop =
-            totalConsumed >= DROP_ALERT_THRESHOLD && !fake && !postRecovery;
+            totalConsumed >= dropThreshold && !fake && !postRecovery;
 
           drops.push({
             at: baselineTs.toISOString(),
@@ -343,8 +365,8 @@ export class FuelStatsService {
             isConfirmedDrop: false,
           });
         }
-      } else if (delta >= RISE_THRESHOLD) {
-        // ── Large rise (≥ 8 L): mirrors Python's handle_fuel_rise thread ───────
+      } else if (delta >= riseThreshold) {
+        // ── Large rise: mirrors Python's handle_fuel_rise thread ───────────────
         const baselineFuel = prev.fuel;
         const baselineTs = prev.ts;
         const consolidationEndMs =
@@ -352,6 +374,9 @@ export class FuelStatsService {
 
         // Consolidation: find the true peak within the stabilisation window.
         let peakFuel = row.fuel;
+        // When the fill finished — post-fill verification anchors here, not on
+        // the baseline reading. See RefuelEvent.peakAt.
+        let peakTs = row.ts;
         let k = i + 1;
         // Track whether fuel fell back below the rise threshold WITHIN the
         // consolidation window — strong indicator of a sensor fake-spike.
@@ -363,8 +388,15 @@ export class FuelStatsService {
           const nextFuel = validRows[k].fuel;
           if (nextFuel > peakFuel) {
             peakFuel = nextFuel;
-          } else if (nextFuel < baselineFuel + RISE_THRESHOLD) {
-            if (peakFuel - nextFuel > POST_REFUEL_VERIFY_EPS_LITERS) {
+            peakTs = validRows[k].ts;
+          } else if (nextFuel < baselineFuel + riseThreshold) {
+            if (
+              peakFuel - nextFuel >
+              eventToleranceLiters(
+                peakFuel - baselineFuel,
+                POST_REFUEL_VERIFY_EPS_LITERS,
+              )
+            ) {
               falledBackInConsolidation = true;
             }
             break;
@@ -373,28 +405,55 @@ export class FuelStatsService {
         }
 
         const totalAdded = peakFuel - baselineFuel;
+        // Scale the verification checks to the rise being validated — see
+        // eventToleranceLiters(); unchanged (8 L) for any rise ≥ 8 L.
+        const riseTolerance = eventToleranceLiters(
+          totalAdded,
+          POST_REFUEL_VERIFY_EPS_LITERS,
+        );
 
-        if (totalAdded >= RISE_THRESHOLD) {
+        if (totalAdded >= riseThreshold) {
           // ── Layer A: isFakeRise (mirrors Python is_fake_rise) ────────────────
           // Short-circuit: if fuel fell back significantly within the 15-min
           // consolidation window, treat it as a fake spike immediately.
           const fakeRise =
-            falledBackInConsolidation || isFakeRise(baselineTs, validRows);
+            falledBackInConsolidation ||
+            isFakeRise(
+              baselineTs,
+              validRows,
+              SPIKE_WINDOW_MINUTES,
+              riseTolerance,
+            );
 
           // ── Layer B: isRecoveryRise (mirrors Python is_recovery_rise) ─────────
           const recoveryRise =
             !fakeRise &&
-            isRecoveryRise(baselineTs, baselineFuel, peakFuel, validRows);
+            isRecoveryRise(
+              baselineTs,
+              baselineFuel,
+              peakFuel,
+              validRows,
+              RISE_RECOVERY_LOOKBACK_MINUTES,
+              riseTolerance,
+            );
 
           // ── Layer C: isPostRefuelFallback (mirrors Python post-refuel verify) ──
           const postFallback =
             !fakeRise &&
             !recoveryRise &&
-            isPostRefuelFallback(baselineTs, baselineFuel, peakFuel, validRows);
+            isPostRefuelFallback(
+              baselineTs,
+              baselineFuel,
+              peakFuel,
+              validRows,
+              SPIKE_WINDOW_MINUTES,
+              riseTolerance,
+            );
 
           if (!fakeRise && !recoveryRise && !postFallback) {
             refuels.push({
               at: baselineTs.toISOString(),
+              peakAt: peakTs.toISOString(),
               fuelBefore: Math.round(baselineFuel * 100) / 100,
               fuelAfter: Math.round(peakFuel * 100) / 100,
               added: Math.round(totalAdded * 100) / 100,

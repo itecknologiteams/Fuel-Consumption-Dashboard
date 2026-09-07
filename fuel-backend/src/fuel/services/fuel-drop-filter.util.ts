@@ -95,6 +95,121 @@ export const POST_REFUEL_VERIFY_EPS_LITERS = 8.0;
  */
 export const RISE_RETENTION_FRACTION = 0.5;
 
+/**
+ * Minimum drop/rise (litres) that counts as a real event while the vehicle is
+ * STATIONARY — lowered from the 8 L moving threshold so small siphons and
+ * small top-ups are no longer invisible.
+ *
+ * Parked, the sensor is steady to a few tenths of a litre, so 3 L sits well
+ * clear of the noise floor. Moving, fuel slosh swings the same sensor by
+ * 10-15 L between consecutive readings, which is why DROP_ALERT_THRESHOLD /
+ * RISE_THRESHOLD (8 L) still govern events with the vehicle in motion.
+ */
+export const STATIONARY_EVENT_THRESHOLD = 3.0;
+
+/**
+ * Speed (km/h) at or below which the vehicle counts as stationary for the
+ * STATIONARY_EVENT_THRESHOLD. Matches the dispatch module's "at rest" gate:
+ * GPS speed jitters by a km/h or two on a parked vehicle, so a strict 0 would
+ * reject genuine stops. Deliberately well below DROP_GATING_MAX_SPEED_KMH
+ * (10 km/h) — that gate means "not driving", this one means "standing still".
+ */
+export const STATIONARY_MAX_SPEED_KMH = 5.0;
+
+/**
+ * Minutes of stillness required BEFORE an event for the stationary threshold
+ * to apply. Fuel keeps sloshing after a vehicle stops and the level settles
+ * by several litres; without this delay every stop would manufacture a 3 L
+ * "drop" or "refuel". Matches the 2-minute pre-event lookback that
+ * isFakeSpike / isFakeRise already use.
+ */
+export const STATIONARY_SETTLE_MINUTES = 2;
+
+/**
+ * Builds a constant-time test for "was the vehicle standing still for this
+ * event" over a reading series, given the indices of the pair of readings the
+ * event sits between.
+ *
+ * An event counts as stationary when neither of its two readings, nor any
+ * reading in the STATIONARY_SETTLE_MINUTES before them, was moving. The
+ * settling margin matters because fuel keeps sloshing after a vehicle stops
+ * and the level settles by several litres — without it, every stop would
+ * manufacture a 3 L "drop" or "refuel".
+ *
+ * Built once per series rather than rescanning the window per event: the
+ * analysis walk visits every reading, so a scan each time is quadratic and
+ * unusable over a month of 1-minute data (~45k readings).
+ */
+export function stationaryEventTester(
+  readings: FuelReading[],
+  maxSpeedKmh: number = STATIONARY_MAX_SPEED_KMH,
+  settleMinutes: number = STATIONARY_SETTLE_MINUTES,
+): (prevIndex: number, currIndex: number) => boolean {
+  const settleMs = settleMinutes * 60 * 1000;
+
+  // lastMovingMs[i] = timestamp of the newest reading at or before i where the
+  // vehicle was moving; null while it has been at rest for the whole series.
+  const lastMovingMs: Array<number | null> = readings.map(() => null);
+  let newestMoving: number | null = null;
+  for (let i = 0; i < readings.length; i++) {
+    if ((readings[i].speed ?? 0) > maxSpeedKmh) {
+      newestMoving = readings[i].ts.getTime();
+    }
+    lastMovingMs[i] = newestMoving;
+  }
+
+  return (prevIndex: number, currIndex: number): boolean => {
+    if (
+      prevIndex < 0 ||
+      currIndex < 0 ||
+      prevIndex >= readings.length ||
+      currIndex >= readings.length
+    ) {
+      return false;
+    }
+
+    const windowStart = readings[prevIndex].ts.getTime() - settleMs;
+    const moving = lastMovingMs[currIndex];
+    return moving === null || moving < windowStart;
+  };
+}
+
+/**
+ * How much fuel movement is significant when VALIDATING an event of the given
+ * magnitude — the scale the fake-spike / fake-rise / fall-back checks measure
+ * recovery against.
+ *
+ * Distinct from minEventLiters(), which decides whether a change qualifies as
+ * an event at all. Feeding the 3 L stationary floor into the validation checks
+ * instead breaks them: their "did it stay down / stay up" tests scan for the
+ * first sub-move at or above the scale given, so a small scale latches onto
+ * sensor noise and rejects genuine large events.
+ *
+ * At or above `cap` the event gets the full tolerance, exactly as before this
+ * function existed. Below it — only reachable now that stationary events as
+ * small as 3 L are detected — the tolerance shrinks with the event, so a 3 L
+ * top-up is verified as strictly as a tank fill instead of sailing through
+ * checks whose epsilon is wider than the event itself.
+ */
+export function eventToleranceLiters(
+  magnitude: number,
+  cap: number = POST_REFUEL_VERIFY_EPS_LITERS,
+): number {
+  const size = Math.max(0, magnitude);
+  return size >= cap ? cap : size * RISE_RETENTION_FRACTION;
+}
+
+/**
+ * Minimum litres for a drop/rise to count as a real event: 3 L standing
+ * still, `movingThreshold` (8 L) in motion.
+ */
+export function minEventLiters(
+  stationary: boolean,
+  movingThreshold: number,
+): number {
+  return stationary ? STATIONARY_EVENT_THRESHOLD : movingThreshold;
+}
+
 // ─── Typed row ────────────────────────────────────────────────────────────────
 
 export interface FuelReading {
@@ -205,6 +320,44 @@ export function isDropConfirmedAfterDelay(
   return stillDropped && vehicleStationary;
 }
 
+/** How far back the movement veto looks before a candidate event point. */
+const MOVEMENT_VETO_LOOKBACK_MINUTES = 2;
+
+/**
+ * True when the vehicle was continuously moving in the run-up to EVERY point
+ * in `candidates` — the condition for writing a fuel change off as slosh.
+ *
+ * Every candidate, not just the first: the median filter lags the detected
+ * event, so the window is scanned for the reading where fuel actually crossed
+ * the threshold. A vehicle sloshing on its way to a stop crosses that
+ * threshold on the move and again once parked, and judging only the first
+ * crossing vetoed the parked event that followed it. If any candidate had a
+ * stationary run-up, the change is not slosh.
+ */
+function continuouslyMovingBefore(
+  candidates: Date[],
+  readings: FuelReading[],
+  maxSpeedKmh: number,
+): boolean {
+  const lookbackMs = MOVEMENT_VETO_LOOKBACK_MINUTES * 60 * 1000;
+  let sawEvidence = false;
+
+  for (const candidate of candidates) {
+    const runUp = readings.filter(
+      (r) =>
+        r.ts < candidate && r.ts.getTime() >= candidate.getTime() - lookbackMs,
+    );
+    if (!runUp.length) continue; // no evidence either way for this candidate
+
+    sawEvidence = true;
+    if (runUp.some((r) => (r.speed ?? 0) <= maxSpeedKmh)) {
+      return false; // came to a stop before this one → not slosh
+    }
+  }
+
+  return sawEvidence;
+}
+
 // ─── Layer 3: Fake-Spike Detection ───────────────────────────────────────────
 
 /**
@@ -255,18 +408,14 @@ export function isFakeSpike(
   //   • Continuously moving before drop → sloshing → fake
   //   • Parked before drop (even if driving away after) → theft → real
   const startFuel = readings[0].fuel;
-  const rawDropIdx = readings.findIndex(
-    (r, i) => i > 0 && r.fuel < startFuel - dropThreshold,
-  );
-  const rawDropAt = rawDropIdx !== -1 ? readings[rawDropIdx].ts : dropAt;
+  const rawDropCandidates = readings
+    .filter((r, i) => i > 0 && r.fuel < startFuel - dropThreshold)
+    .map((r) => r.ts);
+  if (!rawDropCandidates.length) rawDropCandidates.push(dropAt);
 
-  const preLookbackMs = 2 * 60 * 1000;
-  const preReadings = readings.filter(
-    (r) => r.ts < rawDropAt && r.ts.getTime() >= rawDropAt.getTime() - preLookbackMs,
-  );
-  const vehicleContinuouslyMovingBeforeDrop =
-    preReadings.length > 0 && preReadings.every((r) => (r.speed ?? 0) > maxSpeedKmh);
-  if (vehicleContinuouslyMovingBeforeDrop) return true;
+  if (continuouslyMovingBefore(rawDropCandidates, readings, maxSpeedKmh)) {
+    return true;
+  }
 
   // ── Fuel-pattern checks ───────────────────────────────────────────────────
   const finalFuel = readings[readings.length - 1].fuel;
@@ -434,18 +583,14 @@ export function isFakeRise(
   //   • Continuously moving before rise → sloshing → fake
   //   • Parked before rise (even if driving away after) → real refuel
   const startFuelForRise = readings[0].fuel;
-  const rawRiseIdx = readings.findIndex(
-    (r, i) => i > 0 && r.fuel > startFuelForRise + riseThreshold,
-  );
-  const rawRiseAt = rawRiseIdx !== -1 ? readings[rawRiseIdx].ts : riseAt;
+  const rawRiseCandidates = readings
+    .filter((r, i) => i > 0 && r.fuel > startFuelForRise + riseThreshold)
+    .map((r) => r.ts);
+  if (!rawRiseCandidates.length) rawRiseCandidates.push(riseAt);
 
-  const preLookbackMs = 2 * 60 * 1000;
-  const preRiseReadings = readings.filter(
-    (r) => r.ts < rawRiseAt && r.ts.getTime() >= rawRiseAt.getTime() - preLookbackMs,
-  );
-  const vehicleContinuouslyMovingBeforeRise =
-    preRiseReadings.length > 0 && preRiseReadings.every((r) => (r.speed ?? 0) > maxSpeedKmh);
-  if (vehicleContinuouslyMovingBeforeRise) return true;
+  if (continuouslyMovingBefore(rawRiseCandidates, readings, maxSpeedKmh)) {
+    return true;
+  }
 
   // ── Fuel-pattern checks ───────────────────────────────────────────────────
   const startFuel = readings[0].fuel;
@@ -457,18 +602,30 @@ export function isFakeRise(
   // Did not sustain the rise → fake
   if (Math.abs(finalFuel - startFuel) <= riseThreshold) return true;
 
-  // Find first large sub-rise and check if it stayed high
+  // Scan ALL large sub-rises in the window — mirroring the same fix already
+  // made to isFakeSpike's sub-drop scan.
+  //
+  // Returning on the FIRST sub-rise made a real refuel look fake whenever the
+  // window also caught the drive to the station: fuel slosh throws up 8-15 L
+  // sub-rises that immediately fall back, and the scan judged the whole window
+  // on one of those. The refuel that followed was never looked at.
+  // → fake only when EVERY large sub-rise fell back.
+  let foundLargeSubrise = false;
   for (let i = 0; i < readings.length - 1; i++) {
     const delta = readings[i + 1].fuel - readings[i].fuel;
     if (delta >= riseThreshold) {
+      foundLargeSubrise = true;
       const stayedHigh = readings
         .slice(i + 1)
         .every((r) => Math.abs(r.fuel - readings[i].fuel) > riseThreshold);
-      return !stayedHigh; // stayed high → real; fell back → fake
+      if (stayedHigh) return false; // sustained rise found → real
+      // this sub-rise fell back → keep scanning for a sustained one
     }
   }
 
-  return false;
+  // All large sub-rises fell back → fake.
+  // No large sub-rise at all → real (gradual rise already vetted above).
+  return foundLargeSubrise;
 }
 
 // ─── Refuel: Stationary-Drop Recovery Detection ──────────────────────────────
