@@ -26,6 +26,7 @@ import {
 import { FuelStatsService } from './services/fuel-stats.service';
 import { ThriftService } from './services/thrift.service';
 import { TheftDetectionService } from './services/theft-detection.service';
+import { RouteHistoryService } from './services/route-history.service';
 import { FuelHistoryDto } from './dto/fuel-history.dto';
 import { FuelConsumptionDto } from './dto/fuel-consumption.dto';
 import { InjectDataSource } from '@nestjs/typeorm';
@@ -45,6 +46,7 @@ export class FuelController {
     private readonly statsService: FuelStatsService,
     private readonly thriftService: ThriftService,
     private readonly theftDetectionService: TheftDetectionService,
+    private readonly routeHistory: RouteHistoryService,
     @InjectDataSource() private readonly dataSource: DataSource,
   ) {}
 
@@ -578,42 +580,25 @@ export class FuelController {
 
   /**
    * GET /vehicles/:imei/fuel/route?from=&to=
-   * Returns GPS track points for a trip (used to draw the route polyline on the map).
-   * Points are downsampled to ≤ 600 for performant map rendering.
+   * Route history: the full track (drift and position jumps removed, shape
+   * simplified to fit the map), stops, and every fuel drop / refuel placed
+   * where it happened. Works for vehicles without a fuel sensor too (no
+   * fuel data or events then).
    */
   @Get('route')
   async getTripRoute(
     @Param('imei') imei: string,
     @Query() query: FuelConsumptionDto,
   ) {
-    this.logger.log(`GET /vehicles/${imei}/fuel/route from=${query.from} to=${query.to}`);
-    const { from, to } = this.parseDateRange(query.from, query.to);
-
-    const rows = await this.dynQuery.getRowsInRangeOrEmpty(imei, from, to);
-
-    // Filter out invalid / zero coordinates
-    const valid = rows.filter(
-      (r) => r.lat && r.lng && !(r.lat === 0 && r.lng === 0),
+    this.logger.log(
+      `GET /vehicles/${imei}/fuel/route from=${query.from} to=${query.to}`,
     );
-
-    // Downsample so the frontend never receives > 600 points
-    const MAX_POINTS = 600;
-    const step = Math.max(1, Math.floor(valid.length / MAX_POINTS));
-    const points = valid
-      .filter((_, i) => i % step === 0 || i === valid.length - 1)
-      .map((r) => ({
-        lat:   r.lat,
-        lng:   r.lng,
-        speed: r.speed ?? 0,
-        ts:    r.dt_tracker instanceof Date
-          ? r.dt_tracker.toISOString()
-          : new Date(r.dt_tracker).toISOString(),
-      }));
-
+    const { from, to } = this.parseDateRange(query.from, query.to);
+    const data = await this.routeHistory.getRouteHistory(imei, from, to);
     return {
       success: true,
-      message: `${points.length} GPS points returned`,
-      data: { points, totalPoints: points.length },
+      message: `${data.points.length} GPS points returned`,
+      data,
     };
   }
 

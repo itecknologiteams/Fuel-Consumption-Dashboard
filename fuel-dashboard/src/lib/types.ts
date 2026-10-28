@@ -741,11 +741,57 @@ export interface TripRoutePoint {
   lng: number;
   speed: number;
   ts: string;
+  /** Fuel level at this fix (null without a fuel sensor). */
+  fuel: number | null;
+  ignition: boolean;
+  /** Tracker was silent before this point — the path in between is unknown. */
+  gap?: boolean;
+}
+
+export interface TripRouteStop {
+  from: string;
+  to: string;
+  durationMin: number;
+  lat: number;
+  lng: number;
+  /** Share of the stop with the ignition on (idling vs parked). */
+  ignitionOnPct: number;
+  fuelStart: number | null;
+  fuelEnd: number | null;
+}
+
+export interface TripRouteFuelEvent {
+  type: "drop" | "refuel";
+  at: string;
+  amount: number;
+  fuelBefore: number;
+  fuelAfter: number;
+  unit: string;
+  confirmed: boolean;
+  lat: number;
+  lng: number;
+  speed: number;
 }
 
 export interface TripRouteData {
+  imei: string;
+  from: string;
+  to: string;
+  unit: string | null;
   points: TripRoutePoint[];
   totalPoints: number;
+  stops: TripRouteStop[];
+  events: TripRouteFuelEvent[];
+  summary: {
+    fixes: number;
+    distanceKm: number;
+    movingMinutes: number;
+    maxSpeedKmh: number;
+    startedAt: string | null;
+    endedAt: string | null;
+    start: { lat: number; lng: number } | null;
+    end: { lat: number; lng: number } | null;
+  };
 }
 
 // ─── Theft Locations Report ────────────────────────────────────────────────

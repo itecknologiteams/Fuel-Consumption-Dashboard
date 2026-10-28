@@ -58,10 +58,27 @@ export function haversineKm(
 const fixTime = (f: TrackFix): number =>
   (f.ts ?? new Date(f.dt_tracker as Date | string)).getTime();
 
-/** Total km over fixes in time order. */
-export function trackDistanceKm(fixes: TrackFix[]): number {
-  let km = 0;
-  let anchor: { lat: number; lng: number; t: number } | null = null;
+export interface TrackAnchor<T> {
+  fix: T;
+  /** Km from the previous anchor (0 for the first, or after a gap). */
+  km: number;
+  /** True when this anchor follows a gap — the path before it is unknown. */
+  afterGap: boolean;
+}
+
+/**
+ * The fixes that make up the driven path, by the anchor rules above: drift
+ * and position jumps are dropped, so consecutive anchors form a clean track
+ * line, and their `km` values sum to trackDistanceKm().
+ */
+export function trackAnchors<T extends TrackFix>(fixes: T[]): TrackAnchor<T>[] {
+  const out: TrackAnchor<T>[] = [];
+  let anchor: { lat: number; lng: number } | null = null;
+  // Time of the last believable fix (anchor or drift around it). Gaps and
+  // jump speeds are judged from here, not from the anchor: a vehicle parked
+  // for hours keeps reporting, so leaving the stop is not a gap — and a bad
+  // fix after a long stop still reads as an impossible jump.
+  let lastT = 0;
 
   for (const f of fixes) {
     const lat = Number(f.lat);
@@ -69,20 +86,30 @@ export function trackDistanceKm(fixes: TrackFix[]): number {
     if (!isValidFix(lat, lng)) continue;
     const t = fixTime(f);
     if (anchor === null) {
-      anchor = { lat, lng, t };
+      anchor = { lat, lng };
+      lastT = t;
+      out.push({ fix: f, km: 0, afterGap: false });
       continue;
     }
-    const dtMs = t - anchor.t;
+    const dtMs = t - lastT;
     if (!(dtMs > 0)) continue;
     if (dtMs > MAX_SEGMENT_GAP_MS) {
-      anchor = { lat, lng, t };
+      anchor = { lat, lng };
+      lastT = t;
+      out.push({ fix: f, km: 0, afterGap: true });
       continue;
     }
     const d = haversineKm(anchor.lat, anchor.lng, lat, lng);
-    if (d / (dtMs / 3_600_000) > MAX_SEGMENT_SPEED_KMH) continue;
-    if (d < MIN_SEGMENT_KM) continue;
-    km += d;
-    anchor = { lat, lng, t };
+    if (d / (dtMs / 3_600_000) > MAX_SEGMENT_SPEED_KMH) continue; // jump
+    lastT = t;
+    if (d < MIN_SEGMENT_KM) continue; // drift
+    anchor = { lat, lng };
+    out.push({ fix: f, km: d, afterGap: false });
   }
-  return km;
+  return out;
+}
+
+/** Total km over fixes in time order. */
+export function trackDistanceKm(fixes: TrackFix[]): number {
+  return trackAnchors(fixes).reduce((km, a) => km + a.km, 0);
 }
