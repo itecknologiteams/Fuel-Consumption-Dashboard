@@ -2,7 +2,7 @@
 
 import { AlertTriangle, TrendingUp, CheckCircle, Info } from "lucide-react";
 import { VehicleSummary } from "@/lib/types";
-import { fmtTime, fmtDateShort } from "@/lib/dateUtils";
+import { AlertType, FleetAlert, buildFleetAlerts } from "@/lib/fleetAlerts";
 
 function CardSkeleton() {
   return (
@@ -19,11 +19,14 @@ function CardSkeleton() {
   );
 }
 
-interface Props { vehicles: VehicleSummary[]; loading: boolean; }
+interface Props {
+  vehicles: VehicleSummary[];
+  loading: boolean;
+  selectedImei?: string;
+  onSelectImei?: (imei: string) => void;
+}
 
-type AlertType = "late" | "warning" | "active" | "info";
-
-const TAG_MAP: Record<AlertType, {
+export const TAG_MAP: Record<AlertType, {
   label: string;
   Icon: React.ElementType;
   iconColor: string;
@@ -67,48 +70,13 @@ const TAG_MAP: Record<AlertType, {
 
 const AVATAR_COLORS = ["#E84040", "#3B82F6", "#22C55E", "#A855F7", "#F59E0B"];
 
-export default function ActiveAlerts({ vehicles, loading }: Props) {
+export default function ActiveAlerts({ vehicles, loading, selectedImei, onSelectImei }: Props) {
   if (loading) return <CardSkeleton />;
 
-  const alerts: { type: AlertType; title: string; sub: string; initials: string; time: string }[] = [];
-
-  vehicles.forEach((v) => {
-    const initials = v.name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
-    const time = fmtTime(v.lastSeen);
-
-    if (v.status === "offline") {
-      alerts.push({
-        type: "late",
-        title: `${v.name} is offline`,
-        sub: `Last: ${fmtDateShort(v.lastSeen)}`,
-        initials, time,
-      });
-    } else if ((v.currentFuel ?? 0) < 10) {
-      alerts.push({
-        type: "warning",
-        title: `Low fuel — ${v.name}`,
-        sub: `${(v.currentFuel ?? 0).toFixed(1)} L · ${v.plateNumber}`,
-        initials, time,
-      });
-    } else if ((v.consumed ?? 0) > 50) {
-      alerts.push({
-        type: "warning",
-        title: `High consumption`,
-        sub: `${(v.consumed ?? 0).toFixed(1)} L · Rs ${(v.cost ?? 0).toLocaleString()}`,
-        initials, time,
-      });
-    } else {
-      alerts.push({
-        type: "active",
-        title: `${v.name} normal`,
-        sub: `${(v.consumed ?? 0).toFixed(1)} L · ${v.plateNumber}`,
-        initials, time,
-      });
-    }
-  });
+  const alerts: FleetAlert[] = buildFleetAlerts(vehicles);
 
   if (alerts.length === 0) {
-    alerts.push({ type: "info", title: "No active alerts", sub: "Fleet operating normally", initials: "✓", time: "" });
+    alerts.push({ key: "none", imei: "", type: "info", title: "No active alerts", sub: "Fleet operating normally", initials: "✓", time: "" });
   }
 
   return (
@@ -125,12 +93,19 @@ export default function ActiveAlerts({ vehicles, loading }: Props) {
         {alerts.slice(0, 5).map((alert, i) => {
           const t = TAG_MAP[alert.type];
           const Icon = t.Icon;
+          const clickable = !!alert.imei && !!onSelectImei;
+          const isSelected = !!alert.imei && alert.imei === selectedImei;
           return (
             <div
-              key={i}
-              className="rounded-xl p-3.5 transition-all"
+              key={alert.key}
+              role={clickable ? "button" : undefined}
+              tabIndex={clickable ? 0 : undefined}
+              title={clickable ? "Show this vehicle on the dashboard" : undefined}
+              onClick={clickable ? () => onSelectImei!(alert.imei) : undefined}
+              onKeyDown={clickable ? e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelectImei!(alert.imei); } } : undefined}
+              className={`rounded-xl p-3.5 transition-all${clickable ? " cursor-pointer hover:shadow-sm" : ""}`}
               style={{
-                background: "var(--color-surface-2)",
+                background: isSelected ? "rgba(var(--color-primary-rgb),0.04)" : "var(--color-surface-2)",
                 border: "1px solid var(--color-border-soft)",
                 borderLeft: `3px solid ${t.borderColor}`,
                 borderRadius: 12,

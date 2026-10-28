@@ -29,6 +29,7 @@ import QuickCalendar        from "@/components/QuickCalendar";
 import ActiveAlerts         from "@/components/ActiveAlerts";
 import FleetTargets         from "@/components/FleetTargets";
 import { ShimmerStyle }     from "@/components/LoadingSkeleton";
+import { buildFleetAlerts } from "@/lib/fleetAlerts";
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 
@@ -198,22 +199,34 @@ const DashboardPage = memo(function DashboardPage() {
     return () => clearInterval(id);
   }, [token, selectedImei, range.from, range.to]);
 
-  // ── Date handlers (with validation) ───────────────────────────────────────
+  // ── Date handlers ─────────────────────────────────────────────────────────
+  // Pickers hand over a day; the range covers whole days — start of the first
+  // through end of the last (or now, for today). Quoting the end day at its
+  // midnight dropped that day's data and made a single-day pick impossible.
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const endOfDay   = (d: Date) => new Date(Math.min(
+    new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() - 1,
+    Date.now(),
+  ));
+
+  function selectDay(day: Date) {
+    setRange({ from: startOfDay(day).toISOString(), to: endOfDay(day).toISOString() });
+  }
+
   function handleFromChange(v: string) {
     try {
-      const newFrom = dateInputToISO(v);
-      // Don't allow from >= to
-      if (new Date(newFrom) >= new Date(range.to)) return;
-      setRange(r => ({ ...r, from: newFrom }));
+      const day = new Date(dateInputToISO(v));
+      if (startOfDay(day).getTime() > Date.now()) return;
+      // A new start begins a new selection: show that day until an end is picked.
+      selectDay(day);
     } catch { /* ignore invalid input */ }
   }
 
   function handleToChange(v: string) {
     try {
-      const newTo = dateInputToISO(v);
-      // Don't allow to <= from
-      if (new Date(newTo) <= new Date(range.from)) return;
-      setRange(r => ({ ...r, to: newTo }));
+      const newTo = endOfDay(new Date(dateInputToISO(v)));
+      if (newTo <= new Date(range.from)) return;
+      setRange(r => ({ ...r, to: newTo.toISOString() }));
     } catch { /* ignore invalid input */ }
   }
 
@@ -231,11 +244,12 @@ const DashboardPage = memo(function DashboardPage() {
   // ── Derived (memoized) ────────────────────────────────────────────────────
   const selectedVehicle = useMemo(() => vehicles.find(v => v.imei === selectedImei), [vehicles, selectedImei]);
   const primarySensor   = useMemo(() => fuelSensors?.sensors[0], [fuelSensors]);
+  const fleetAlerts     = useMemo(() => buildFleetAlerts(summary?.vehicles ?? []), [summary]);
 
+  // Verified refuels only — the same ones counted in "Total Refueled".
   const refuelList = useMemo(() =>
-    consumption?.refuels?.length ? consumption.refuels.map(r => ({ ...r })) :
-    refuelEvents?.refuelEvents   ? refuelEvents.refuelEvents
-    : [],
+    consumption?.refuels ? consumption.refuels.filter(r => r.isVerified !== false) :
+    refuelEvents?.refuelEvents ?? [],
     [consumption, refuelEvents]
   );
 
@@ -257,11 +271,18 @@ const DashboardPage = memo(function DashboardPage() {
             className="hidden xl:flex flex-shrink-0 flex-col gap-4 py-5 px-4 overflow-y-auto scroll-panel"
             style={{ width: 288, background: "var(--color-surface)", borderLeft: "1px solid var(--color-border)" }}
           >
-            <ActiveAlerts vehicles={summary?.vehicles ?? []} loading={loadingSummary} />
+            <ActiveAlerts
+              vehicles={summary?.vehicles ?? []}
+              loading={loadingSummary}
+              selectedImei={selectedImei}
+              onSelectImei={setSelectedImei}
+            />
             <FleetTargets
               vehicles={summary?.vehicles ?? []}
               totalConsumed={summary?.totals.consumed ?? 0}
               loading={loadingSummary}
+              efficiency={fuelStats?.efficiency}
+              vehicleName={selectedVehicle?.name}
             />
           </aside>
         }
@@ -269,6 +290,7 @@ const DashboardPage = memo(function DashboardPage() {
           {/* Header — outside scroll container so dropdown escapes overflow */}
           <div style={{ position: "relative", zIndex: 50, flexShrink: 0, background: "var(--color-bg)", padding: "20px 24px 16px" }}>
             <MainHeader
+              alerts={fleetAlerts}
               vehicles={vehicles}
               selectedImei={selectedImei}
               onSelectImei={setSelectedImei}
@@ -324,7 +346,14 @@ const DashboardPage = memo(function DashboardPage() {
                 currentFuel={currentFuel}
                 loading={loadingVehicleData}
               />
-              <QuickCalendar />
+              <QuickCalendar
+                token={token}
+                imei={selectedImei}
+                vehicleName={selectedVehicle?.name}
+                from={range.from}
+                to={range.to}
+                onSelectDay={selectDay}
+              />
             </div>
 
             <div className="h-8" />
