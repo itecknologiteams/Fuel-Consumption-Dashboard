@@ -11,11 +11,12 @@ import {
 } from "lucide-react";
 
 import { useAuth } from "@/contexts/AuthContext";
-import { getVehicles, getFuelConsumption, getCurrentFuel, getFuelStats, getFuelDropAlerts } from "@/lib/api";
-import { Vehicle, FuelConsumptionData, FuelCurrentData, FuelStatsData, ApiError, FuelDropDetail } from "@/lib/types";
+import { getVehicles, getFuelConsumption, getCurrentFuel, getFuelStats, getFuelDropAlerts, getTripRoute } from "@/lib/api";
+import { Vehicle, FuelConsumptionData, FuelCurrentData, FuelStatsData, ApiError, FuelDropDetail, TripRouteData } from "@/lib/types";
 import { logAnomalies } from "@/lib/fuelAnomalyUtils";
 import AppShell from "@/components/AppShell";
 import { FuelEvent } from "@/components/RouteMap";
+import TrackPlayback from "@/components/TrackPlayback";
 import { fmtDateDisplay, fmtDateTime, toLocalMidnight } from "@/lib/dateUtils";
 
 const RouteMap = dynamic(() => import("@/components/RouteMap"), { ssr: false });
@@ -198,6 +199,8 @@ export default function RoutesPage() {
   const [fuelStats,       setFuelStats]       = useState<FuelStatsData | null>(null);
   const [fuelEvents,      setFuelEvents]      = useState<FuelEvent[]>([]);
   const [pythonDrops,     setPythonDrops]     = useState<FuelDropDetail[]>([]);
+  const [track,           setTrack]           = useState<TripRouteData | null>(null);
+  const [playhead,        setPlayhead]        = useState<number | null>(null);
   const [loading,         setLoading]         = useState(false);
   const [loadingVehicles, setLoadingVehicles] = useState(false);
   const [error,           setError]           = useState<string | null>(null);
@@ -244,17 +247,21 @@ export default function RoutesPage() {
     setFuelStats(null);
     setFuelEvents([]);
     setPythonDrops([]);
+    setTrack(null);
+    setPlayhead(null);
 
     Promise.allSettled([
       getCurrentFuel(token, selectedImei),
       getFuelConsumption(token, selectedImei, range.from, range.to),
       getFuelStats(token, selectedImei, range.from, range.to),
       getFuelDropAlerts(token, selectedImei, range.from, range.to),
-    ]).then(([cur, cons, stats, pyDrops]) => {
-    
+      getTripRoute(token, selectedImei, range.from, range.to),
+    ]).then(([cur, cons, stats, pyDrops, route]) => {
+
       if (cancelled) return;
       if (cur.status   === "fulfilled") setCurrentFuel(cur.value);
       if (stats.status === "fulfilled") setFuelStats(stats.value);
+      if (route.status === "fulfilled") setTrack(route.value);
 
       // Python-confirmed drops from fuel_drop_alerts table (ground truth)
       const confirmedDrops: FuelDropDetail[] = pyDrops.status === "fulfilled"
@@ -440,6 +447,22 @@ export default function RoutesPage() {
     // Only show legitimate refuels (hide small anomalous ones)
     if (e.type === "refuel" && !isLegitimateRefuel(e)) return false;
     return activeFilter === "all" ? true : activeFilter === "drops" ? e.type === "drop" : e.type === "refuel";
+  });
+
+  // The same events, placed on the route: the backend positions each drop /
+  // refuel from the full-resolution fixes; anything it didn't list (e.g. an
+  // alert from the monitoring script) goes to the nearest track point in time.
+  const mapEvents: FuelEvent[] = filteredEvents.map(e => {
+    const t = new Date(e.at).getTime();
+    const exact = track?.events.find(x => x.type === e.type && Math.abs(new Date(x.at).getTime() - t) < 60_000);
+    if (exact) return { ...e, lat: exact.lat, lng: exact.lng };
+    const pts = track?.points ?? [];
+    if (!pts.length) return e;
+    let best = pts[0];
+    for (const p of pts) {
+      if (Math.abs(new Date(p.ts).getTime() - t) < Math.abs(new Date(best.ts).getTime() - t)) best = p;
+    }
+    return { ...e, lat: best.lat, lng: best.lng };
   });
 
   // Confirmed drops: >= 8 L and fuel stayed low for 7 continuous minutes
@@ -639,11 +662,32 @@ export default function RoutesPage() {
               vehicles={vehicles}
               selectedImei={selectedImei}
               onSelectVehicle={setSelectedImei}
-              fuelEvents={filteredEvents}
+              fuelEvents={mapEvents}
               currentFuel={currentFuel}
               dropCount={dropCount}
               refuelCount={refuelCount}
+              track={track}
+              playhead={playhead}
             />
+
+            {/* ── Route history playback ─────────────────────────────── */}
+            {track && track.points.length > 1 && !loading && (
+              <TrackPlayback
+                track={track}
+                events={mapEvents}
+                index={playhead}
+                onIndexChange={setPlayhead}
+              />
+            )}
+            {track && track.points.length <= 1 && !loading && (
+              <div style={{
+                position: "absolute", left: "50%", bottom: 14, transform: "translateX(-50%)", zIndex: 999,
+                background: "rgba(255,255,255,0.97)", border: "1px solid var(--color-border-soft)", borderRadius: 12,
+                padding: "8px 14px", fontSize: 12, color: "var(--color-text-3)", boxShadow: "0 4px 16px rgba(0,0,0,0.1)",
+              }}>
+                No movement recorded for this vehicle in the selected period
+              </div>
+            )}
 
             {/* ── Floating selected-vehicle info card ─────────────────── */}
             {selectedVehicle && !loading && (

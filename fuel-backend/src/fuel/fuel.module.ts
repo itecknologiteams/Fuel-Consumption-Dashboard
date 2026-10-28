@@ -14,6 +14,7 @@ import { FuelStatsService } from './services/fuel-stats.service';
 import { ThriftService } from './services/thrift.service';
 import { TheftDetectionService } from './services/theft-detection.service';
 import { TripAnalyzerService } from './services/trip-analyzer.service';
+import { RouteHistoryService } from './services/route-history.service';
 import { FuelAnomalyMiddleware } from '../common/middleware/fuel-anomaly.middleware';
 
 @Module({
@@ -28,6 +29,7 @@ import { FuelAnomalyMiddleware } from '../common/middleware/fuel-anomaly.middlew
     ThriftService,
     TheftDetectionService,
     TripAnalyzerService,
+    RouteHistoryService,
     FuelAnomalyMiddleware,
   ],
   exports: [

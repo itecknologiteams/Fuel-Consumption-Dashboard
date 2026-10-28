@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { Vehicle, FuelCurrentData } from "@/lib/types";
+import { Vehicle, FuelCurrentData, TripRouteData, TripRoutePoint } from "@/lib/types";
 import { fmtDateTime } from "@/lib/dateUtils";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -35,6 +35,76 @@ interface Props {
   currentFuel?: FuelCurrentData | null;
   dropCount?: number;
   refuelCount?: number;
+  /** Route history of the selected vehicle for the period. */
+  track?: TripRouteData | null;
+  /** Index into track.points shown by the playback marker. */
+  playhead?: number | null;
+}
+
+const TRACK_COLOR = "#2563EB";
+
+function makeLetterIcon(letter: string, color: string) {
+  const html = `
+    <div style="width:28px;height:28px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);
+      background:${color};border:2.5px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.3);
+      display:flex;align-items:center;justify-content:center;">
+      <span style="transform:rotate(45deg);font-size:12px;font-weight:900;color:white;">${letter}</span>
+    </div>`;
+  return L.divIcon({ html, className: "", iconSize: [28, 28], iconAnchor: [14, 28] });
+}
+
+function makeStopIcon(idling: boolean) {
+  const color = idling ? "#F59E0B" : "#1D4ED8";
+  const html = `
+    <div style="width:20px;height:20px;border-radius:5px;background:${color};border:2px solid white;
+      box-shadow:0 1px 6px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;
+      font-size:11px;font-weight:900;color:white;">P</div>`;
+  return L.divIcon({ html, className: "", iconSize: [20, 20], iconAnchor: [10, 10] });
+}
+
+function makeDropIcon(type: "drop" | "refuel", amount: number) {
+  const isDrop = type === "drop";
+  const color = isDrop ? "#ef4444" : "#22c55e";
+  const html = `
+    <div style="display:flex;flex-direction:column;align-items:center;">
+      <div style="background:${color};color:white;font-size:10px;font-weight:800;padding:2px 6px;
+        border-radius:6px;border:2px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.3);white-space:nowrap;">
+        ${isDrop ? "▼ −" : "▲ +"}${amount.toFixed(1)} L
+      </div>
+      <div style="width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;
+        border-top:6px solid ${color};"></div>
+    </div>`;
+  return L.divIcon({ html, className: "", iconSize: [70, 26], iconAnchor: [35, 26] });
+}
+
+const playheadIcon = L.divIcon({
+  html: `<div style="width:18px;height:18px;border-radius:50%;background:#E84040;border:3px solid white;
+    box-shadow:0 0 0 4px rgba(232,64,64,0.3),0 2px 8px rgba(0,0,0,0.35);"></div>`,
+  className: "",
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+});
+
+/** Zoom to the whole track whenever a new one loads. */
+function FitTrack({ points }: { points: TripRoutePoint[] }) {
+  const map = useMap();
+  useEffect(() => {
+    if (points.length < 2) return;
+    map.fitBounds(L.latLngBounds(points.map(p => [p.lat, p.lng] as [number, number])), { padding: [50, 50] });
+  }, [points, map]);
+  return null;
+}
+
+/** Keep the playback marker in view while it plays. */
+function FollowPlayhead({ point }: { point: TripRoutePoint | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!point) return;
+    if (!map.getBounds().pad(-0.1).contains([point.lat, point.lng])) {
+      map.panTo([point.lat, point.lng], { animate: true, duration: 0.3 });
+    }
+  }, [point, map]);
+  return null;
 }
 
 // ── Fix leaflet default icon (broken in Next.js) ─────────────────────────────
@@ -144,19 +214,6 @@ function makeTruckIcon(
   });
 }
 
-function makeEventIcon(color: string, num: number) {
-  const html = `
-    <div style="
-      width:26px;height:26px;border-radius:50%;
-      background:${color};border:2.5px solid white;
-      box-shadow:0 2px 8px rgba(0,0,0,0.22);
-      display:flex;align-items:center;justify-content:center;
-      font-size:10px;font-weight:800;color:white;cursor:pointer;">
-      ${num}
-    </div>`;
-  return L.divIcon({ html, className: "", iconSize: [26, 26], iconAnchor: [13, 13] });
-}
-
 // ── Auto-fit bounds ───────────────────────────────────────────────────────────
 
 function FitBounds({ vehicles }: { vehicles: Vehicle[] }) {
@@ -222,9 +279,27 @@ function FuelEventsList({ events }: { events: FuelEvent[] }) {
 
 export default function RouteMap({
   vehicles, selectedImei, onSelectVehicle, fuelEvents,
-  currentFuel, dropCount = 0, refuelCount = 0,
+  currentFuel, dropCount = 0, refuelCount = 0, track, playhead,
 }: Props) {
   useEffect(() => { fixLeafletIcons(); }, []);
+
+  // Track split where the tracker went silent: solid where the path is
+  // known, a dashed link across each gap.
+  const trackPoints = useMemo(() => track?.points ?? [], [track]);
+  const { segments, gapLinks } = useMemo(() => {
+    const segs: [number, number][][] = [];
+    const links: [number, number][][] = [];
+    for (let i = 0; i < trackPoints.length; i++) {
+      const p = trackPoints[i];
+      if (i === 0 || p.gap) {
+        if (i > 0) links.push([[trackPoints[i - 1].lat, trackPoints[i - 1].lng], [p.lat, p.lng]]);
+        segs.push([]);
+      }
+      segs[segs.length - 1].push([p.lat, p.lng]);
+    }
+    return { segments: segs, gapLinks: links };
+  }, [trackPoints]);
+  const playPoint = playhead != null ? trackPoints[playhead] ?? null : null;
 
   const center: [number, number] = vehicles[0]?.lat
     ? [vehicles[0].lat, vehicles[0].lng]
@@ -246,9 +321,6 @@ export default function RouteMap({
       ? Math.min(100, Math.max(0, (rawFuel / estimatedCapacity) * 100))
       : undefined;
 
-  // GPS-tagged events only (for polyline)
-  const gpsEvents = fuelEvents.filter(e => e.lat != null && e.lng != null);
-
   return (
     <MapContainer
       center={center}
@@ -264,6 +336,65 @@ export default function RouteMap({
 
       <FitBounds vehicles={vehicles} />
       <PanToSelected imei={selectedImei} vehicles={vehicles} />
+      <FitTrack points={trackPoints} />
+      <FollowPlayhead point={playPoint} />
+
+      {/* ── Route history track ─────────────────────────────────────── */}
+      {gapLinks.map((pos, i) => (
+        <Polyline key={`gap-${i}`} positions={pos}
+          pathOptions={{ color: "#94A3B8", weight: 2, opacity: 0.8, dashArray: "6 6" }} />
+      ))}
+      {segments.map((pos, i) => (
+        <Polyline key={`seg-${i}`} positions={pos}
+          pathOptions={{ color: TRACK_COLOR, weight: 4, opacity: 0.85, lineJoin: "round" }} />
+      ))}
+
+      {track?.summary.start && trackPoints.length > 0 && (
+        <Marker position={[track.summary.start.lat, track.summary.start.lng]} icon={makeLetterIcon("A", "#16a34a")} zIndexOffset={600}>
+          <Popup><b>Start</b><br />{fmtTime(track.summary.startedAt ?? "")}</Popup>
+        </Marker>
+      )}
+      {track?.summary.end && trackPoints.length > 0 && (
+        <Marker position={[track.summary.end.lat, track.summary.end.lng]} icon={makeLetterIcon("B", "#1A1A2E")} zIndexOffset={600}>
+          <Popup><b>End</b><br />{fmtTime(track.summary.endedAt ?? "")}</Popup>
+        </Marker>
+      )}
+
+      {track?.stops.map((s, i) => {
+        const idling = s.ignitionOnPct >= 50;
+        return (
+          <Marker key={`stop-${s.from}-${i}`} position={[s.lat, s.lng]} icon={makeStopIcon(idling)} zIndexOffset={400}>
+            <Popup>
+              <div style={{ minWidth: 180, fontFamily: "system-ui, sans-serif" }}>
+                <p style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
+                  {idling ? "Stop · engine idling" : "Stop · parked"}
+                </p>
+                <p style={{ fontSize: 11, color: "var(--color-text-3)" }}>
+                  {fmtTime(s.from)} → {fmtTime(s.to)}
+                </p>
+                <p style={{ fontSize: 11, marginTop: 2 }}>
+                  Duration: <b>{s.durationMin >= 60 ? `${Math.floor(s.durationMin / 60)} h ${s.durationMin % 60} min` : `${s.durationMin} min`}</b>
+                  {" · "}ignition on {s.ignitionOnPct}%
+                </p>
+                {s.fuelStart != null && s.fuelEnd != null && (
+                  <p style={{ fontSize: 11, marginTop: 2 }}>
+                    Fuel: {s.fuelStart.toFixed(1)} → <b>{s.fuelEnd.toFixed(1)} L</b>
+                    {Math.abs(s.fuelEnd - s.fuelStart) >= 1 && (
+                      <span style={{ color: s.fuelEnd < s.fuelStart ? "#ef4444" : "#16a34a", fontWeight: 700 }}>
+                        {" "}({s.fuelEnd < s.fuelStart ? "−" : "+"}{Math.abs(s.fuelEnd - s.fuelStart).toFixed(1)} L)
+                      </span>
+                    )}
+                  </p>
+                )}
+              </div>
+            </Popup>
+          </Marker>
+        );
+      })}
+
+      {playPoint && (
+        <Marker position={[playPoint.lat, playPoint.lng]} icon={playheadIcon} zIndexOffset={2000} />
+      )}
 
       {/* ── Vehicle markers ────────────────────────────────────────────── */}
       {vehicles.filter(v => v.lat && v.lng).map(v => {
@@ -395,8 +526,8 @@ export default function RouteMap({
             <Marker
               key={`gps-${ev.type}-${ev.at}-${i}`}
               position={[ev.lat!, ev.lng!]}
-              icon={makeEventIcon(col, i + 1)}
-              zIndexOffset={500}
+              icon={makeDropIcon(ev.type, ev.amount ?? 0)}
+              zIndexOffset={isDrop ? 900 : 800}
             >
               <Popup>
                 <div style={{ minWidth: 170, fontFamily: "system-ui, sans-serif" }}>
@@ -416,14 +547,6 @@ export default function RouteMap({
             </Marker>
           );
         })}
-
-      {/* ── Route polyline if GPS data exists ─────────────────────────── */}
-      {gpsEvents.length >= 2 && (
-        <Polyline
-          positions={gpsEvents.map(e => [e.lat!, e.lng!] as [number, number])}
-          pathOptions={{ color: "#E84040", weight: 3.5, opacity: 0.85 }}
-        />
-      )}
     </MapContainer>
   );
 }
