@@ -1,6 +1,6 @@
 "use client";
 
-import { VehicleSummary } from "@/lib/types";
+import { FuelEfficiency, VehicleSummary } from "@/lib/types";
 
 function CardSkeleton() {
   return (
@@ -19,9 +19,16 @@ function CardSkeleton() {
   );
 }
 
-interface Props { vehicles: VehicleSummary[]; totalConsumed: number; loading: boolean; }
+interface Props {
+  vehicles: VehicleSummary[];
+  totalConsumed: number;
+  loading: boolean;
+  /** Selected vehicle's efficiency for the period (from fuel stats). */
+  efficiency?: FuelEfficiency | null;
+  vehicleName?: string;
+}
 
-export default function FleetTargets({ vehicles, totalConsumed, loading }: Props) {
+export default function FleetTargets({ vehicles, totalConsumed, loading, efficiency, vehicleName }: Props) {
   if (loading) return <CardSkeleton />;
 
   const BUDGET   = 100;
@@ -91,20 +98,31 @@ export default function FleetTargets({ vehicles, totalConsumed, loading }: Props
         ))}
       </div>
 
-      {/* Route efficiency highlight */}
+      {/* Selected vehicle's fuel efficiency */}
       <div
         className="mt-5 rounded-xl p-4 text-center"
         style={{ background: "var(--color-primary)" }}
       >
         <p className="text-xs font-semibold mb-1" style={{ color: "rgba(255,255,255,0.75)" }}>
-          Route Efficiency
+          Fuel Efficiency{vehicleName ? ` · ${vehicleName}` : ""}
         </p>
-        <p className="text-3xl font-bold text-white">
-          {onlinePct}<span className="text-lg">%</span>
-        </p>
-        <p className="text-xs mt-1" style={{ color: "rgba(255,255,255,0.7)" }}>
-          Best performance this period
-        </p>
+        {efficiency && efficiency.kmPerLiter > 0 ? (
+          <>
+            <p className="text-3xl font-bold text-white">
+              {efficiency.kmPerLiter.toFixed(1)}<span className="text-lg"> km/L</span>
+            </p>
+            <p className="text-xs mt-1" style={{ color: "rgba(255,255,255,0.7)" }}>
+              {efficiency.totalDistanceKm.toFixed(1)} km · {efficiency.litersPer100km.toFixed(1)} L/100 km this period
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="text-3xl font-bold text-white">—</p>
+            <p className="text-xs mt-1" style={{ color: "rgba(255,255,255,0.7)" }}>
+              {efficiency ? `${efficiency.totalDistanceKm.toFixed(1)} km driven — not enough to rate` : "No trip data this period"}
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

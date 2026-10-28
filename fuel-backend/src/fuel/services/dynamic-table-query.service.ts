@@ -1,10 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
-import {
-  STATIONARY_MAX_SPEED_KMH,
-  STATIONARY_SETTLE_MINUTES,
-} from './fuel-drop-filter.util';
 
 export interface DataRow {
   dt_tracker: Date;
@@ -76,95 +72,24 @@ export class DynamicTableQueryService {
   }
 
   /**
-   * The newest reading taken with the vehicle standing still — the last
-   * trustworthy fuel level.
+   * The vehicle's live state exactly as the GPS server holds and displays it:
+   * the gs_objects row, whose `params` carries the last known value of every
+   * parameter (a packet that omits one doesn't blank it).
    *
-   * A level read in motion is worth ±15 L of slosh, so "current fuel" has to
-   * come from a reading at rest even when that means reaching back to before
-   * the vehicle set off. At rest means under `maxSpeedKmh` with nothing moving
-   * in the `settleSeconds` before it, because fuel keeps sloshing for a while
-   * after a stop.
-   *
-   * Runs as a narrow scan of timestamps and speeds, then one fetch of the row
-   * that wins. Expressing the settling rule as a correlated NOT EXISTS instead
-   * measured 8-14 s per vehicle on a busy tracker — unusable in the dashboard's
-   * per-vehicle loop, where this costs ~35 ms.
-   *
-   * Returns null when the vehicle has not stood still within the scanned
-   * window; callers fall back to the reading as taken.
+   * "Current fuel" is quoted from here so the portal reads the same number as
+   * the GPS server. It used to reach back to the last reading taken at rest
+   * instead, which showed a pre-refill level on a stationary site whose GPS
+   * speed jitters, and a blank gauge whenever that row lacked the fuel param.
    */
-  async getLatestStationaryRow(
-    imei: string,
-    maxSpeedKmh: number,
-    settleSeconds: number,
-    lookbackHours = 24,
-    maxScanRows = 2000,
-  ): Promise<DataRow | null> {
-    await this.assertTableExists(imei);
-    const tableName = this.getTableName(imei);
-    const since = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
-
-    const recent: Array<{ dt_tracker: Date; speed: number }> =
-      await this.dataSource.query(
-        `SELECT dt_tracker, speed
-         FROM \`${tableName}\`
-         WHERE dt_tracker >= ?
-         ORDER BY dt_tracker DESC
-         LIMIT ?`,
-        [since, maxScanRows],
-      );
-
-    if (!recent.length) return null;
-
-    // Oldest → newest so the settling margin can be applied as we go.
-    const settleMs = settleSeconds * 1000;
-    let lastMovingMs: number | null = null;
-    let settledAt: Date | null = null;
-
-    for (let i = recent.length - 1; i >= 0; i--) {
-      const ts = new Date(recent[i].dt_tracker);
-      const tsMs = ts.getTime();
-
-      if (recent[i].speed > maxSpeedKmh) {
-        lastMovingMs = tsMs;
-      } else if (lastMovingMs === null || lastMovingMs < tsMs - settleMs) {
-        settledAt = ts;
-      }
-    }
-
-    if (!settledAt) return null;
-
+  async getLiveRow(imei: string): Promise<DataRow | null> {
     const rows: DataRow[] = await this.dataSource.query(
       `SELECT dt_tracker, dt_server, lat, lng, speed, params
-       FROM \`${tableName}\`
-       WHERE dt_tracker = ?
+       FROM gs_objects
+       WHERE imei = ?
        LIMIT 1`,
-      [settledAt],
+      [imei],
     );
-
     return rows[0] ?? null;
-  }
-
-  /**
-   * The reading a fuel level should be quoted from.
-   *
-   * Prefers the newest reading taken at rest, because a level sampled in
-   * motion is worth ±15 L of slosh. Falls back to the newest reading as taken
-   * when the vehicle has not stood still recently — a rough level beats a
-   * blank gauge.
-   */
-  async getLatestRestingRow(imei: string): Promise<DataRow | null> {
-    const resting = await this.getLatestStationaryRow(
-      imei,
-      STATIONARY_MAX_SPEED_KMH,
-      STATIONARY_SETTLE_MINUTES * 60,
-    );
-    if (resting) return resting;
-
-    this.logger.debug(
-      `IMEI ${imei}: no stationary reading in the recent window — quoting the fuel level as taken`,
-    );
-    return this.getLatestRow(imei);
   }
 
   /**

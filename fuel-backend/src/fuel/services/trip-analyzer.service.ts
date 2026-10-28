@@ -6,6 +6,7 @@ import {
   DataRow,
 } from './dynamic-table-query.service';
 import { ConsumptionResult, periodConsumed } from './fuel-consumption.service';
+import { trackDistanceKm } from './track-distance.util';
 
 const NOISE_THRESHOLD = 0.5;
 const MIN_TRIP_DURATION_MINUTES = 5;
@@ -15,9 +16,6 @@ const IGNITION_GAP_THRESHOLD_MS = 30 * 60 * 1000;
 const MOVEMENT_START_SPEED_KMH = 5;
 const MOVEMENT_STOP_SPEED_KMH = 2;
 const MOVEMENT_STOP_END_MS = 10 * 60 * 1000;
-const MAX_DISTANCE_SEGMENT_GAP_MS = 5 * 60 * 1000;
-const MIN_DISTANCE_SEGMENT_KM = 0.02; // 20m: suppress GPS jitter
-const MAX_REASONABLE_SEGMENT_SPEED_KMH = 160;
 const MIN_REFUEL_RISE_L = 3.0;
 const BOUNDARY_MEDIAN_SAMPLES = 3;
 
@@ -420,28 +418,7 @@ export class TripAnalyzerService {
   }
 
   private calcTripDistance(rows: EnrichedRow[]): number {
-    let dist = 0;
-    for (let i = 1; i < rows.length; i++) {
-      const a = rows[i - 1];
-      const b = rows[i];
-      if (
-        !this.isValidCoordinatePair(a.lat, a.lng) ||
-        !this.isValidCoordinatePair(b.lat, b.lng)
-      )
-        continue;
-
-      const dtMs = b.ts.getTime() - a.ts.getTime();
-      if (dtMs <= 0 || dtMs > MAX_DISTANCE_SEGMENT_GAP_MS) continue;
-
-      const segmentKm = this.haversineKm(a.lat, a.lng, b.lat, b.lng);
-      if (segmentKm < MIN_DISTANCE_SEGMENT_KM) continue;
-
-      const segmentSpeedKmh = segmentKm / (dtMs / 3600000);
-      if (segmentSpeedKmh > MAX_REASONABLE_SEGMENT_SPEED_KMH) continue;
-
-      dist += segmentKm;
-    }
-    return dist;
+    return trackDistanceKm(rows);
   }
 
   private calcTripFuelMetrics(rows: EnrichedRow[]): {

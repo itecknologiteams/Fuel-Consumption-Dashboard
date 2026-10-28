@@ -20,6 +20,8 @@ import {
   normalizeTripFuelToPeriod,
 } from '../../fuel/services/trip-analyzer.service';
 import { TheftDetectionService } from '../../fuel/services/theft-detection.service';
+import { drainOf, drainShares } from '../../fuel/services/fuel-drain.util';
+import { trackDistanceKm } from '../../fuel/services/track-distance.util';
 import {
   AssignmentRecord,
   AssignmentRepository,
@@ -36,12 +38,8 @@ import { ReportsService } from '../reports.service';
 
 // ─── Tuning ──────────────────────────────────────────────────────────────────
 
-/** Fuel deltas smaller than this are sensor noise, not consumption. */
-const NOISE_THRESHOLD = 0.5;
 /** Speed above which fuel burn is attributed to "high speed" waste. */
 const HIGH_SPEED_KMH = 100;
-/** Below this the vehicle counts as stationary (idle burn). */
-const IDLE_SPEED_KMH = 2;
 /** Telemetry gaps longer than this are offline, not engine-on time. */
 const MAX_ENGINE_GAP_MS = 30 * 60 * 1000;
 /** Distance filters — mirror TripAnalyzerService so totals stay comparable. */
@@ -274,7 +272,8 @@ export class MasterReportService {
       ]);
 
     const movement = this.summariseMovement(samples);
-    const burn = this.summariseBurn(samples);
+    // Idle / high-speed are shares of the period's real burn (fuel-drain.util).
+    const shares = drainShares(samples, HIGH_SPEED_KMH);
 
     const truncatedAssignments = assignmentRecords.length > MAX_ASSIGNMENTS;
     const analysed = await this.buildAssignments(
@@ -286,9 +285,9 @@ export class MasterReportService {
     );
 
     const unit = sensor?.units || consumption?.unit || 'L';
-    const periodConsumedLiters = consumption
-      ? periodConsumed(consumption)
-      : burn.totalConsumed;
+    const periodConsumedLiters = consumption ? periodConsumed(consumption) : 0;
+    const idleBurn = drainOf(periodConsumedLiters, shares.idle);
+    const highSpeedBurn = drainOf(periodConsumedLiters, shares.highSpeed);
 
     // Trips' raw per-trip fuel (a drop-sum within each trip window) can
     // inflate under sensor oscillation just like the whole-period drop sum
@@ -356,11 +355,11 @@ export class MasterReportService {
         openingFuel: consumption?.firstFuel ?? null,
         closingFuel: consumption?.lastFuel ?? null,
         netDrop: consumption?.netDrop ?? null,
-        idleLiters: round2(burn.idleLiters),
-        idlePercentage: pct(burn.idleLiters, burn.totalConsumed),
-        highSpeedLiters: round2(burn.highSpeedLiters),
-        highSpeedPercentage: pct(burn.highSpeedLiters, burn.totalConsumed),
-        highSpeedEvents: burn.highSpeedEvents,
+        idleLiters: idleBurn.liters,
+        idlePercentage: idleBurn.percentage,
+        highSpeedLiters: highSpeedBurn.liters,
+        highSpeedPercentage: highSpeedBurn.percentage,
+        highSpeedEvents: shares.highSpeedEvents,
         speedThresholdKmh: HIGH_SPEED_KMH,
         refuels: consumption?.refuels ?? [],
       },
@@ -561,11 +560,13 @@ export class MasterReportService {
       if (prev.ignition && dtMs <= MAX_ENGINE_GAP_MS) engineOnMs += dtMs;
       if (dtMs <= MAX_ENGINE_GAP_MS) {
         if (prev.speed > 5) movingMs += dtMs;
-        else idleMs += dtMs;
+        // Idle = engine running while stopped. Counting every stopped minute
+        // reported a parked, switched-off vehicle as idling 12 h a day.
+        else if (prev.ignition) idleMs += dtMs;
       }
 
-      distanceKm += segmentKm(prev, curr, dtMs);
     }
+    distanceKm = trackDistanceKm(samples);
 
     return {
       distanceKm,
@@ -577,34 +578,6 @@ export class MasterReportService {
     };
   }
 
-  /** Where the fuel went: idle burn vs high-speed burn vs the rest. */
-  private summariseBurn(samples: Sample[]) {
-    let totalConsumed = 0;
-    let idleLiters = 0;
-    let highSpeedLiters = 0;
-    let highSpeedEvents = 0;
-    let prev: Sample | null = null;
-
-    for (const s of samples) {
-      if (s.fuel === null) continue;
-      if (prev !== null && prev.fuel !== null) {
-        const delta = s.fuel - prev.fuel;
-        if (delta < -NOISE_THRESHOLD) {
-          const burned = Math.abs(delta);
-          totalConsumed += burned;
-          if (prev.speed < IDLE_SPEED_KMH && prev.ignition)
-            idleLiters += burned;
-          if (prev.speed > HIGH_SPEED_KMH) {
-            highSpeedLiters += burned;
-            highSpeedEvents++;
-          }
-        }
-      }
-      prev = s;
-    }
-
-    return { totalConsumed, idleLiters, highSpeedLiters, highSpeedEvents };
-  }
 
   // ─── Assignments, stops, deviations ────────────────────────────────────────
 

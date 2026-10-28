@@ -19,7 +19,10 @@ import {
   FuelHistoryService,
   FuelInterval,
 } from './services/fuel-history.service';
-import { FuelConsumptionService } from './services/fuel-consumption.service';
+import {
+  FuelConsumptionService,
+  periodConsumed,
+} from './services/fuel-consumption.service';
 import { FuelStatsService } from './services/fuel-stats.service';
 import { ThriftService } from './services/thrift.service';
 import { TheftDetectionService } from './services/theft-detection.service';
@@ -88,7 +91,7 @@ export class FuelController {
       `GET /vehicles/${imei}/fuel/current sensorId=${sensorIdStr}`,
     );
 
-    const row = await this.dynQuery.getLatestRestingRow(imei);
+    const row = await this.dynQuery.getLiveRow(imei);
     const ts = row ? new Date(row.dt_tracker).toISOString() : null;
 
     if (sensorIdStr) {
@@ -256,6 +259,10 @@ export class FuelController {
 
     const totalConsumed =
       Math.round(tankResults.reduce((s, r) => s + r.consumed, 0) * 100) / 100;
+    const totalPeriodConsumed =
+      Math.round(
+        tankResults.reduce((s, r) => s + periodConsumed(r), 0) * 100,
+      ) / 100;
     const totalRefueled =
       Math.round(tankResults.reduce((s, r) => s + r.refueled, 0) * 100) / 100;
     const totalCost = tankResults.every((r) => r.estimatedCost !== null)
@@ -297,6 +304,7 @@ export class FuelController {
         from: from.toISOString(),
         to: to.toISOString(),
         consumed: totalConsumed,
+        periodConsumed: totalPeriodConsumed,
         refueled: totalRefueled,
         estimatedCost: totalCost,
         unit: sensors[0].units || 'L',
@@ -353,6 +361,7 @@ export class FuelController {
         fcrJson,
       );
       for (const r of result.refuels) {
+        if (r.isVerified === false) continue; // matches `refueled` everywhere
         allRefuels.push({
           sensorId: sensor.sensorId,
           sensorName: sensor.name,

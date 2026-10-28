@@ -6,6 +6,7 @@ import {
 import { FuelConsumptionService } from './fuel-consumption.service';
 import { FuelSensor } from './fuel-sensor-resolver.service';
 import { FuelTransformService } from './fuel-transform.service';
+import { FuelAnomalyMiddleware } from '../../common/middleware/fuel-anomaly.middleware';
 
 /**
  * A fuel sensor is only trustworthy on a stationary vehicle — in motion slosh
@@ -81,6 +82,7 @@ async function analyse(segments: Segment[]) {
     new FuelTransformService(),
     dynQuery,
     {} as DataSource, // only used by getPythonAlerts, not by getConsumption
+    new FuelAnomalyMiddleware(),
   );
 
   return service.getConsumption(IMEI, from, to, SENSOR, '');

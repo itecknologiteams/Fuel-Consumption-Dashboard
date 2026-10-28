@@ -6,8 +6,25 @@ import { createPortal } from "react-dom";
 import { Vehicle } from "@/lib/types";
 import { useAuth } from "@/contexts/AuthContext";
 import { fmtDateDisplay, toLocalMidnight } from "@/lib/dateUtils";
+import { FleetAlert, actionableAlerts } from "@/lib/fleetAlerts";
+import { TAG_MAP } from "@/components/ActiveAlerts";
+
+const SEEN_ALERTS_KEY = "fuel-dashboard:seen-alerts";
+
+function loadSeenAlerts(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(SEEN_ALERTS_KEY) ?? "[]") as string[]);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSeenAlerts(keys: Set<string>) {
+  try { localStorage.setItem(SEEN_ALERTS_KEY, JSON.stringify([...keys])); } catch { /* storage unavailable */ }
+}
 
 interface Props {
+  alerts: FleetAlert[];
   vehicles: Vehicle[];
   selectedImei: string;
   onSelectImei: (imei: string) => void;
@@ -28,6 +45,7 @@ const toMidnight  = (iso: string) => toLocalMidnight(iso);
 const fmtDisplay  = (iso: string) => fmtDateDisplay(iso);
 
 export default function MainHeader({
+  alerts,
   vehicles,
   selectedImei,
   onSelectImei,
@@ -38,8 +56,31 @@ export default function MainHeader({
   loadingVehicles,
 }: Props) {
   const { username } = useAuth();
-  const offlineCount = vehicles.filter(v => v.status === "offline").length;
   const selected = vehicles.find(v => v.imei === selectedImei);
+
+  // ── Notifications ─────────────────────────────────────────────
+  const [bellOpen, setBellOpen] = useState(false);
+  const bellRef = useRef<HTMLDivElement>(null);
+  // Alerts only arrive after mount, so the server and first client render agree (no badge) either way.
+  const [seenAlerts, setSeenAlerts] = useState<Set<string>>(() =>
+    typeof window === "undefined" ? new Set() : loadSeenAlerts());
+
+  const needsAttention = actionableAlerts(alerts);
+  const unreadCount = needsAttention.filter(a => !seenAlerts.has(a.key)).length;
+  // Attention-worthy first; healthy vehicles after, so the list doubles as a fleet status view.
+  const bellList = [...needsAttention, ...alerts.filter(a => !needsAttention.includes(a))];
+
+  function markAllRead() {
+    const next = new Set(seenAlerts);
+    needsAttention.forEach(a => next.add(a.key));
+    setSeenAlerts(next);
+    saveSeenAlerts(next);
+  }
+
+  function toggleBell() {
+    setBellOpen(o => !o);
+    if (!bellOpen) markAllRead();
+  }
 
   // ── Date Range Picker State ────────────────────────────────────
   const [calendarOpen, setCalendarOpen] = useState(false);
@@ -88,6 +129,9 @@ export default function MainHeader({
       // Close search dropdown
       if (searchWrapperRef.current && !searchWrapperRef.current.contains(target)) {
         setSearchDropdownOpen(false);
+      }
+      if (bellRef.current && !bellRef.current.contains(target)) {
+        setBellOpen(false);
       }
     }
     document.addEventListener("mousedown", handleClick);
@@ -502,21 +546,97 @@ export default function MainHeader({
         </div>
 
         {/* Notification Bell */}
-        <button
-          type="button"
-          aria-label={offlineCount > 0 ? `Notifications: ${offlineCount} vehicle${offlineCount !== 1 ? "s" : ""} offline` : "Notifications"}
-          title={offlineCount > 0 ? `${offlineCount} vehicle${offlineCount !== 1 ? "s" : ""} offline` : "No new notifications"}
-          className="relative flex items-center justify-center w-9 h-9 rounded-lg"
-          style={{ background: "var(--color-bg)", border: "1px solid var(--color-border-input)" }}
-        >
-          <Bell size={16} style={{ color: "var(--color-text-2)" }} />
-          {offlineCount > 0 && (
-            <span
-              className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full"
-              style={{ background: "var(--color-primary)" }}
-            />
+        <div ref={bellRef} className="relative">
+          <button
+            type="button"
+            onClick={toggleBell}
+            aria-expanded={bellOpen}
+            aria-label={unreadCount > 0 ? `Notifications: ${unreadCount} unread` : "Notifications"}
+            title={unreadCount > 0 ? `${unreadCount} unread alert${unreadCount !== 1 ? "s" : ""}` : "No new notifications"}
+            className="relative flex items-center justify-center w-9 h-9 rounded-lg"
+            style={{
+              background: bellOpen ? "rgba(var(--color-primary-rgb),0.06)" : "var(--color-bg)",
+              border: `1px solid ${bellOpen ? "rgba(var(--color-primary-rgb),0.3)" : "var(--color-border-input)"}`,
+            }}
+          >
+            <Bell size={16} style={{ color: "var(--color-text-2)" }} />
+            {unreadCount > 0 && (
+              <span
+                className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full flex items-center justify-center text-white"
+                style={{ background: "var(--color-primary)", fontSize: 10, fontWeight: 700 }}
+              >
+                {unreadCount > 9 ? "9+" : unreadCount}
+              </span>
+            )}
+          </button>
+
+          {bellOpen && (
+            <div
+              style={{
+                position: "absolute",
+                top: "calc(100% + 8px)",
+                right: 0,
+                width: 340,
+                maxWidth: "calc(100vw - 24px)",
+                background: "#FFFFFF",
+                border: "1px solid var(--color-border)",
+                borderRadius: 14,
+                boxShadow: "0 16px 48px rgba(0,0,0,0.16)",
+                zIndex: 9999,
+                overflow: "hidden",
+              }}
+            >
+              <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: "1px solid var(--color-bg)" }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "var(--color-text-3)", textTransform: "uppercase" }}>
+                  Notifications
+                </span>
+                <span style={{ fontSize: 11, color: "var(--color-text-3)" }}>
+                  {needsAttention.length} need{needsAttention.length === 1 ? "s" : ""} attention
+                </span>
+              </div>
+
+              <div style={{ maxHeight: 320, overflowY: "auto" }}>
+                {bellList.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-8 gap-2">
+                    <Bell size={22} style={{ color: "#DCDCDC" }} />
+                    <p style={{ fontSize: 13, color: "var(--color-text-3)" }}>No notifications</p>
+                  </div>
+                ) : (
+                  bellList.map(a => {
+                    const t = TAG_MAP[a.type];
+                    const Icon = t.Icon;
+                    return (
+                      <div
+                        key={a.key}
+                        onClick={() => { selectVehicle(a.imei); setBellOpen(false); }}
+                        className="flex items-start gap-3 px-4 py-3 cursor-pointer"
+                        style={{
+                          borderLeft: `3px solid ${t.borderColor}`,
+                          background: a.imei === selectedImei ? "rgba(var(--color-primary-rgb),0.05)" : "transparent",
+                        }}
+                        onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.background = "var(--color-surface-2)"; }}
+                        onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.background = a.imei === selectedImei ? "rgba(var(--color-primary-rgb),0.05)" : "transparent"; }}
+                      >
+                        <div className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: t.iconBg }}>
+                          <Icon size={13} style={{ color: t.iconColor }} />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <p style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-1)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {a.title}
+                            </p>
+                            <span style={{ fontSize: 11, color: "var(--color-text-3)", flexShrink: 0 }}>{a.time}</span>
+                          </div>
+                          <p style={{ fontSize: 11, color: "var(--color-text-3)" }}>{a.sub}</p>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
           )}
-        </button>
+        </div>
       </div>
     </div>
   );

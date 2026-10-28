@@ -299,7 +299,8 @@ export default function RoutesPage() {
 
         // Process refuels with anomaly metadata
         const refuelEvents: FuelEvent[] = (c.refuels ?? []).map(r => {
-          const isAnomaly = r._anomaly?.isAnomaly ?? false;
+          // The backend's verdict (isVerified) is the one every total uses.
+          const isAnomaly = r.isVerified === false;
           if (isAnomaly) {
             console.log(`[RoutesPage] 🚨 Anomalous refuel detected: +${r.added}L at ${r.at}`, {
               type: r._anomaly?.anomalyType,
@@ -429,17 +430,9 @@ export default function RoutesPage() {
 
   // First derive the base fuel event categories
   const drops = fuelEvents.filter(e => e.type === "drop");
-  // Filter refuels: include if (a) not anomalous, OR (b) significant amount (>=50L)
-  // The backend's anomaly detection is too aggressive - large refuels are typically real.
-  // A genuine 50L+ "fake_spike" is virtually impossible, so drop the anomaly-type exclusion
-  // for large fills so the routes page matches what the refueling log already shows.
-  const isLegitimateRefuel = (e: FuelEvent) => {
-    if (e.type !== "refuel") return false;
-    // Always include non-anomalous refuels
-    if (!e.isAnomaly) return true;
-    // For anomalous refuels: trust any fill >= 50 L regardless of anomaly type
-    return (e.amount || 0) >= 50;
-  };
+  // Refuels the backend verified — it already trusts 50 L+ fills, so this
+  // matches the refueled total on every other page.
+  const isLegitimateRefuel = (e: FuelEvent) => e.type === "refuel" && !e.isAnomaly;
   const refuels = fuelEvents.filter(isLegitimateRefuel);
   const filteredEvents = fuelEvents.filter(e => {
     // Never show noise / normal-consumption drops — only confirmed drop alerts
@@ -456,45 +449,11 @@ export default function RoutesPage() {
   const refuelCount       = refuels.length;
   const confirmedDropTotal= confirmedDrops.reduce((s, e) => s + e.amount, 0);
 
-  // Calculate total refueled from legitimate refuels only
-  const totalRefueledFromEvents = refuels.reduce((s, e) => s + (e.amount || 0), 0);
-  // consumption.refueled is recalculated by the anomaly middleware (verified-only sum),
-  // so it may undercount real fills. Use the raw events sum as the primary fallback.
-  const rawRefuelTotal = fuelEvents
-    .filter(e => e.type === "refuel")
-    .reduce((s, e) => s + (e.amount || 0), 0);
-  const totalRefueled = totalRefueledFromEvents > 0
-    ? totalRefueledFromEvents
-    : rawRefuelTotal > 0
-      ? rawRefuelTotal
-      : (consumption?.refueled ?? 0);
-  const firstFuel = consumption?.firstFuel ?? null;
-  const lastFuel = consumption?.lastFuel ?? null;
-
-  // Mass-balance formula: (start + refueled) − end = actual consumption.
-  // Falls back to confirmed-drop sum only when boundary readings are missing.
-  let totalDropped: number;
-  if (firstFuel != null && lastFuel != null) {
-    totalDropped = firstFuel + totalRefueled - lastFuel;
-    if (totalDropped < 0) totalDropped = 0;
-  } else {
-    totalDropped = confirmedDrops.reduce((s, e) => s + e.amount, 0);
-  }
-  // Keep existing mass-balance behavior, but suppress tiny sensor oscillation
-  // when vehicle is effectively off and there are no real fuel events.
-  const isIgnitionOff = currentFuel?.ignitionOn === false;
-  const isStationary = (currentFuel?.speed ?? 0) <= 0;
-  const isVehicleOffline = selectedVehicle?.status === "offline";
-  const hasSignificantFuelEvent = confirmedDropCount > 0 || refuelCount > 0;
-  const FLUCTUATION_DEADBAND_L = 0.5;
-  if (
-    !hasSignificantFuelEvent &&
-    totalDropped > 0 &&
-    totalDropped < FLUCTUATION_DEADBAND_L &&
-    (isIgnitionOff || (isVehicleOffline && isStationary))
-  ) {
-    totalDropped = 0;
-  }
+  // The backend's totals — the same figures the dashboard, stats and reports
+  // show for this period (verified refuels; mass-balance burn). Recomputing
+  // them here with different rules made this page disagree with the others.
+  const totalRefueled = consumption?.refueled ?? 0;
+  const totalDropped  = consumption?.periodConsumed ?? consumption?.consumed ?? 0;
   const netChange = totalRefueled - totalDropped;
 
   // Fuel level estimation for the ring (same calc as in RouteMap).

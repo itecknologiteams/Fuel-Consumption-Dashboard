@@ -171,14 +171,11 @@ export default function DarkFuelChart({
                 {consumption && (
                   <span style={{ marginLeft: 10 }}>
                     · Consumed{" "}
+                    {/* Same figure as the dashboard total. Net drop alone goes
+                        short (even negative) on any day with a refuel. */}
                     <span style={{ color: "#ef4444", fontWeight: 600 }}>
-                      {consumption.netDrop != null
-                        ? consumption.netDrop.toFixed(1)
-                        : (consumption.consumed ?? 0).toFixed(1)} L
+                      {(consumption.periodConsumed ?? consumption.consumed ?? 0).toFixed(1)} L
                     </span>
-                    {consumption.netDrop != null && (
-                      <span style={{ fontSize: 10, color: "var(--color-text-3)", marginLeft: 3 }}>(net)</span>
-                    )}
                     {"  "}· Refueled <span style={{ color: "#22c55e", fontWeight: 600 }}>+{(consumption.refueled ?? 0).toFixed(1)} L</span>
                   </span>
                 )}

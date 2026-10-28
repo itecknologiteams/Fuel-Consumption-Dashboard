@@ -199,6 +199,8 @@ export interface FuelConsumptionData {
    * metric because it does NOT inflate from sensor oscillations.
    */
   netDrop?: number | null;
+  /** The period's burn as every portal total shows it (netDrop + refueled, falling back to consumed). */
+  periodConsumed?: number;
   /** Anomaly detection metadata (added by FuelAnomalyMiddleware) */
   _anomalyMeta?: AnomalyMetadata;
   /** Raw fuel readings (for anomaly detection, from backend) */
