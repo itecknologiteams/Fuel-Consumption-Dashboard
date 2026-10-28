@@ -19,6 +19,10 @@ export interface FuelSensor {
   calibration: Array<{ x: number; y: number }>;
 }
 
+// Fuel-named sensors that report something other than the tank level.
+const AUXILIARY_SENSOR_NAME =
+  /temp|batt|volt|rate|econom|used|disconnect|consum/i;
+
 @Injectable()
 export class FuelSensorResolverService {
   private readonly logger = new Logger(FuelSensorResolverService.name);
@@ -48,14 +52,24 @@ export class FuelSensorResolverService {
       [imei],
     );
 
-    if (!rows.length) {
+    // The name match also catches auxiliary readings off the fuel probe
+    // ("Fuel Sensor Temp" °C, "Fuel Sensor Battery" %, "Fuel Rate" l/h…).
+    // Treating those as tanks summed 32 °C + 100 % into "current fuel" and
+    // counted their swings as consumption/refuels. Real tanks are typed
+    // 'fuel'; the name match is only a fallback for vehicles that have none.
+    const tanks = rows.filter((row) => row.type === 'fuel');
+    const levelRows = tanks.length
+      ? tanks
+      : rows.filter((row) => !AUXILIARY_SENSOR_NAME.test(row.name));
+
+    if (!levelRows.length) {
       this.logger.warn(`No fuel sensor configured for IMEI ${imei}`);
       throw new UnprocessableEntityException(
         `No fuel sensor configured for vehicle ${imei}`,
       );
     }
 
-    return rows.map((row) => ({
+    return levelRows.map((row) => ({
       sensorId: row.sensor_id,
       imei: row.imei,
       name: row.name,
