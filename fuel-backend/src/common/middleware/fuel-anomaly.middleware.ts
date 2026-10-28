@@ -56,6 +56,8 @@ export class FuelAnomalyMiddleware implements NestMiddleware {
    * mirrors RISE_RETENTION_FRACTION in fuel-drop-filter.util.ts.
    */
   private readonly RETENTION_FRACTION = 0.5;
+  /** Refuels at least this big count even if an anomaly check trips. */
+  private readonly LARGE_FILL_TRUSTED_L = 50;
 
   /**
    * Tolerance to use when validating one refuel — mirrors
@@ -134,28 +136,45 @@ export class FuelAnomalyMiddleware implements NestMiddleware {
   /**
    * Process fuel response and add anomaly detection
    */
+  /**
+   * Flag each refuel as verified or anomalous against the period's readings.
+   *
+   * Called by the fuel services themselves, before they total anything, so
+   * every page — dashboard summary and reports included, which never pass
+   * through this middleware — counts the same verified refuels.
+   */
+  validateRefuels<T extends { at: string; fuelBefore: number; fuelAfter: number; added: number }>(
+    refuels: T[],
+    readings: FuelReading[],
+  ): Array<T & { _anomaly: RefuelAnomalyResult; isVerified: boolean; reliabilityScore: number }> {
+    return refuels.map((refuel) => {
+      const anomalyCheck = this.detectRefuelAnomaly(refuel, readings);
+      // A fill this large is not a sensor jerk even when a check trips on it
+      // (the Routes page already trusted these; the rule now lives here so
+      // every page counts the same refuels).
+      const trusted =
+        !anomalyCheck.isAnomaly || refuel.added >= this.LARGE_FILL_TRUSTED_L;
+      return {
+        ...refuel,
+        _anomaly: anomalyCheck,
+        isVerified: trusted,
+        reliabilityScore: trusted ? anomalyCheck.confidence : 0,
+      };
+    });
+  }
+
   private processFuelResponse(body: any): any {
     const refuels = body.refuels || body.data?.refuels || [];
 
     if (refuels.length === 0) return body;
 
+    // Already validated by the service (validateRefuels) — totals are final.
+    if (refuels.every((r: any) => r._anomaly)) return body;
+
     // Get readings from response or fetch them
     const readings = this.extractReadings(body);
 
-    // Validate each refuel
-    const validatedRefuels = refuels.map((refuel: any) => {
-      const anomalyCheck = this.detectRefuelAnomaly(refuel, readings);
-
-      return {
-        ...refuel,
-        // Add anomaly metadata
-        _anomaly: anomalyCheck,
-        // Flag for easy filtering
-        isVerified: !anomalyCheck.isAnomaly,
-        // Visual indicator
-        reliabilityScore: anomalyCheck.isAnomaly ? 0 : anomalyCheck.confidence,
-      };
-    });
+    const validatedRefuels = this.validateRefuels(refuels, readings);
 
     // Calculate summary stats
     const anomalySummary = {

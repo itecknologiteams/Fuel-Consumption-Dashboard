@@ -5,6 +5,7 @@ import { FuelSensor } from './fuel-sensor-resolver.service';
 import { FuelTransformService } from './fuel-transform.service';
 import { DynamicTableQueryService } from './dynamic-table-query.service';
 import { DataRow } from './dynamic-table-query.service';
+import { FuelAnomalyMiddleware } from '../../common/middleware/fuel-anomaly.middleware';
 import {
   FuelReading,
   applyMedianFilter,
@@ -51,6 +52,8 @@ const MAX_SINGLE_READING_DROP = 2.0;
 export interface RefuelEvent {
   /** Baseline reading — the last one before the level started climbing. */
   at: string;
+  /** Set by the anomaly check; false = sensor spike, excluded from every total. */
+  isVerified?: boolean;
   /**
    * When the level actually peaked, i.e. when the fill finished.
    *
@@ -107,6 +110,12 @@ export interface ConsumptionResult {
    * was lost" because it does NOT double-count sensor oscillations.
    */
   netDrop: number | null;
+  /**
+   * The period's burn as every portal total shows it — periodConsumed():
+   * netDrop + refueled, falling back to `consumed`. Display this, not
+   * `consumed` (stop-to-stop sum) or `netDrop` (understated by any refuel).
+   */
+  periodConsumed?: number;
   /**
    * Raw fuel readings (for anomaly detection middleware).
    * Optional - only included if readings are available.
@@ -176,6 +185,7 @@ export class FuelConsumptionService {
     private readonly transform: FuelTransformService,
     private readonly dynQuery: DynamicTableQueryService,
     @InjectDataSource() private readonly dataSource: DataSource,
+    private readonly anomaly: FuelAnomalyMiddleware,
   ) {}
 
   /**
@@ -295,7 +305,14 @@ export class FuelConsumptionService {
     // Filter events to only those that fall within the actual requested range.
     const fromIso = from.toISOString();
     const drops = allDrops.filter((d) => d.at >= fromIso);
-    const refuels = allRefuels.filter((r) => r.at >= fromIso);
+    // Refuels are vetted here, before anything is totalled, so a sensor spike
+    // never reaches `refueled`, periodConsumed or cost on any page. All are
+    // returned (flagged) so the UI can still show the rejected ones.
+    const refuels = this.anomaly.validateRefuels(
+      allRefuels.filter((r) => r.at >= fromIso),
+      readings,
+    );
+    const verifiedRefuels = refuels.filter((r) => r.isVerified);
 
     // Indices of the readings inside [from, to] — the warmup only exists to
     // prime the median filter and must not contribute figures.
@@ -329,7 +346,7 @@ export class FuelConsumptionService {
     }
 
     const consumed = this.restToRestConsumed(filtered, restIndices);
-    const refueled = refuels.reduce((sum, r) => sum + r.added, 0);
+    const refueled = verifiedRefuels.reduce((sum, r) => sum + r.added, 0);
     const pricePerLiter = this.extractPricePerLiter(fcrJson, from);
 
     // netDrop = firstFuel - lastFuel: the single most reliable "how much fuel
@@ -365,13 +382,14 @@ export class FuelConsumptionService {
       refueled: roundedRefueled,
       estimatedCost,
       unit: sensor.units || 'L',
-      refuelEvents: refuels.length,
+      refuelEvents: verifiedRefuels.length,
       samples: periodIndices.length,
       refuels,
       drops,
       firstFuel: firstFuel !== null ? Math.round(firstFuel * 100) / 100 : null,
       lastFuel: lastFuel !== null ? Math.round(lastFuel * 100) / 100 : null,
       netDrop,
+      periodConsumed: Math.round(effectiveConsumed * 100) / 100,
       readings, // Include readings for anomaly detection middleware
     };
   }
@@ -445,6 +463,8 @@ export class FuelConsumptionService {
 
     const drops: DropEvent[] = [];
     const refuels: RefuelEvent[] = [];
+    /** Consolidation peak of each refuel, index-aligned with `refuels`. */
+    const refuelPeaks: number[] = [];
     // ── Step 2: index-based walk so we can skip forward after consolidation ──
     let i = 0;
     while (i < transformed.length) {
@@ -722,6 +742,7 @@ export class FuelConsumptionService {
               added: Math.round(adjustedRefuel.added * 100) / 100,
               unit: sensor.units || 'L',
             });
+            refuelPeaks.push(peakFuel);
           }
         }
 
@@ -731,6 +752,20 @@ export class FuelConsumptionService {
       }
 
       i++;
+    }
+
+    // A fill's closing level is read from a window that runs past the fill,
+    // so back-to-back fills (a tank filled in stages) let it pick up the NEXT
+    // fill's level — counting that fill twice (10→60 then 50→60 for 50 L
+    // actually added). Between fills the level only falls, so a fill cannot
+    // close above where the next one starts — unless its own peak did.
+    for (let n = 0; n < refuels.length - 1; n++) {
+      const cur = refuels[n];
+      const ceiling = Math.max(refuelPeaks[n], refuels[n + 1].fuelBefore);
+      if (cur.fuelAfter > ceiling) {
+        cur.fuelAfter = Math.round(ceiling * 100) / 100;
+        cur.added = Math.round(Math.max(0, cur.fuelAfter - cur.fuelBefore) * 100) / 100;
+      }
     }
 
     return { drops, refuels, readings: raw, filtered: transformed, atRest };

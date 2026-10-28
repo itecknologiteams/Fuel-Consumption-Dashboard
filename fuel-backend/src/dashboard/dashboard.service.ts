@@ -172,24 +172,26 @@ export class DashboardService {
         consumed = periodConsumed(result);
         refueled = result.refueled;
         cost = result.estimatedCost;
-
-        const latestRow = await this.dynQuery.getLatestRestingRow(v.imei);
-        if (latestRow) {
-          const rawValue = this.transform.extractRawValue(
-            latestRow.params,
-            sensor.param,
-            v.imei,
-            new Date(latestRow.dt_tracker).toISOString(),
-          );
-          if (rawValue !== null) {
-            currentFuel = this.transform.transform(rawValue, sensor).value;
-          }
-        }
       } catch (err) {
-        // Sensor exists but consumption failed — still include the vehicle.
+        // Sensor exists but consumption failed (e.g. no data in the range) —
+        // still include the vehicle with its live level.
         this.logger.warn(
           `Could not compute fuel summary for IMEI ${v.imei}: ${String(err)}`,
         );
+      }
+
+      // Live level, independent of the period — the GPS server's own reading.
+      const liveRow = await this.dynQuery.getLiveRow(v.imei);
+      if (liveRow) {
+        const rawValue = this.transform.extractRawValue(
+          liveRow.params,
+          sensor.param,
+          v.imei,
+          new Date(liveRow.dt_tracker).toISOString(),
+        );
+        if (rawValue !== null) {
+          currentFuel = this.transform.transform(rawValue, sensor).value;
+        }
       }
 
       return {

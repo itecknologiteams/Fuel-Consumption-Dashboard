@@ -5,10 +5,20 @@ import {
   DynamicTableQueryService,
   DataRow,
 } from './dynamic-table-query.service';
+import {
+  FuelConsumptionService,
+  periodConsumed,
+} from './fuel-consumption.service';
+import {
+  DrainSample,
+  drainOf,
+  drainShares,
+  ignitionOn,
+} from './fuel-drain.util';
+import { trackDistanceKm } from './track-distance.util';
 
-const NOISE_THRESHOLD = 0.5;
-const REFUEL_THRESHOLD = 3.0;
 const HIGH_SPEED_THRESHOLD_KMH = 100;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export type ThriftRating = 'excellent' | 'good' | 'average' | 'poor';
 
@@ -56,6 +66,8 @@ export interface ThriftResult {
   samples: number;
 }
 
+type EnrichedRow = DrainSample & { ts: Date; lat: number; lng: number };
+
 @Injectable()
 export class ThriftService {
   private readonly logger = new Logger(ThriftService.name);
@@ -63,6 +75,7 @@ export class ThriftService {
   constructor(
     private readonly transform: FuelTransformService,
     private readonly dynQuery: DynamicTableQueryService,
+    private readonly consumptionService: FuelConsumptionService,
   ) {}
 
   async getThrift(
@@ -76,23 +89,24 @@ export class ThriftService {
 
     const enriched = this.enrichRows(rows, sensor, imei);
 
-    // Calculate both summed drops and netDrop for accuracy
-    const summedConsumed = this.calcTotalConsumed(enriched);
-    const totalDistanceKm = this.calcTotalDistance(rows);
+    // The period's burn is the same figure the dashboard, stats and
+    // consumption report show. Summing every reading-to-reading fall here
+    // instead reported 9 L for a day that burned 0.8 L.
+    const totalConsumed = await this.consumedBetween(imei, from, to, sensor);
+    const totalDistanceKm = trackDistanceKm(enriched);
 
-    // Use the validated drop-sum from enriched rows.
-    // netDrop (firstFuel − lastFuel) was previously tried here but it
-    // comes from raw unfiltered readings and inflates wildly when a
-    // boundary reading has a sensor spike.
-    const totalConsumed = summedConsumed;
-
-    const idleDrain = this.calcIdleDrain(enriched, totalConsumed);
-    const highSpeedDrain = this.calcHighSpeedDrain(enriched, totalConsumed);
-    const dailyTrend = this.calcDailyTrend(
+    const shares = drainShares(enriched, HIGH_SPEED_THRESHOLD_KMH);
+    const idleDrain = drainOf(totalConsumed, shares.idle);
+    const highSpeedDrain: HighSpeedDrain = {
+      ...drainOf(totalConsumed, shares.highSpeed),
+      events: shares.highSpeedEvents,
+    };
+    const dailyTrend = await this.calcDailyTrend(
+      imei,
+      sensor,
       enriched,
       from,
       to,
-      sensor.units || 'L',
     );
 
     const kmPerLiter =
@@ -105,13 +119,10 @@ export class ThriftService {
         ? Math.round((totalConsumed / totalDistanceKm) * 100 * 100) / 100
         : null;
 
-    // Fleet average km/L estimate for thrift score (use daily trend)
-    const fleetAvgKmPerLiter = kmPerLiter;
     const thriftScore = this.calcThriftScore(
       idleDrain.percentage,
       highSpeedDrain.percentage,
       kmPerLiter,
-      fleetAvgKmPerLiter,
     );
 
     return {
@@ -133,9 +144,34 @@ export class ThriftService {
     };
   }
 
+  /** periodConsumed() over [from, to]; 0 when the window has no readings. */
+  private async consumedBetween(
+    imei: string,
+    from: Date,
+    to: Date,
+    sensor: FuelSensor,
+  ): Promise<number> {
+    try {
+      const result = await this.consumptionService.getConsumption(
+        imei,
+        from,
+        to,
+        sensor,
+        '',
+      );
+      return periodConsumed(result);
+    } catch {
+      return 0;
+    }
+  }
+
   // ─── Enriched row ────────────────────────────────────────────────────────────
 
-  private enrichRows(rows: DataRow[], sensor: FuelSensor, imei: string) {
+  private enrichRows(
+    rows: DataRow[],
+    sensor: FuelSensor,
+    imei: string,
+  ): EnrichedRow[] {
     return rows.map((row) => {
       const ts = new Date(row.dt_tracker);
       const rawValue = this.transform.extractRawValue(
@@ -149,192 +185,64 @@ export class ThriftService {
           ? (this.transform.transform(rawValue, sensor).value ?? null)
           : null;
 
-      let ignition = false;
-      try {
-        const p = JSON.parse(row.params) as Record<string, string | number>;
-        ignition =
-          p['acc'] === '1' ||
-          p['acc'] === 1 ||
-          p['io1'] === '1' ||
-          p['io1'] === 1;
-      } catch {
-        // no ignition data
-      }
-
       return {
         ts,
         fuel,
         lat: row.lat,
         lng: row.lng,
         speed: row.speed,
-        ignition,
+        ignition: ignitionOn(row.params),
       };
     });
   }
 
-  // ─── Total consumed (drop detection) ─────────────────────────────────────────
-
-  private calcTotalConsumed(rows: Array<{ fuel: number | null }>): number {
-    let total = 0;
-    let prev: number | null = null;
-    for (const row of rows) {
-      if (row.fuel === null) continue;
-      if (prev !== null) {
-        const delta = row.fuel - prev;
-        if (delta < -NOISE_THRESHOLD) total += Math.abs(delta);
-      }
-      prev = row.fuel;
-    }
-    return total;
-  }
-
-  // ─── Total distance (Haversine) ───────────────────────────────────────────────
-
-  private calcTotalDistance(rows: DataRow[]): number {
-    let dist = 0;
-    for (let i = 1; i < rows.length; i++) {
-      const a = rows[i - 1];
-      const b = rows[i];
-      if (!a.lat || !a.lng || !b.lat || !b.lng) continue;
-      dist += this.haversineKm(a.lat, a.lng, b.lat, b.lng);
-    }
-    return dist;
-  }
-
-  private haversineKm(
-    lat1: number,
-    lng1: number,
-    lat2: number,
-    lng2: number,
-  ): number {
-    const R = 6371;
-    const dLat = this.toRad(lat2 - lat1);
-    const dLng = this.toRad(lng2 - lng1);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(this.toRad(lat1)) *
-        Math.cos(this.toRad(lat2)) *
-        Math.sin(dLng / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  }
-
-  private toRad(deg: number): number {
-    return (deg * Math.PI) / 180;
-  }
-
-  // ─── Idle Drain ───────────────────────────────────────────────────────────────
-
-  private calcIdleDrain(
-    rows: Array<{ fuel: number | null; speed: number; ignition: boolean }>,
-    totalConsumed: number,
-  ): { liters: number; percentage: number } {
-    let liters = 0;
-    let prevFuel: number | null = null;
-
-    for (const row of rows) {
-      if (row.fuel === null) continue;
-      if (prevFuel !== null) {
-        const delta = row.fuel - prevFuel;
-        if (row.speed < 2 && row.ignition && delta < -NOISE_THRESHOLD) {
-          liters += Math.abs(delta);
-        }
-      }
-      prevFuel = row.fuel;
-    }
-
-    liters = Math.round(liters * 100) / 100;
-    const percentage =
-      totalConsumed > 0
-        ? Math.round((liters / totalConsumed) * 100 * 10) / 10
-        : 0;
-
-    return { liters, percentage };
-  }
-
-  // ─── High Speed Drain ─────────────────────────────────────────────────────────
-
-  private calcHighSpeedDrain(
-    rows: Array<{ fuel: number | null; speed: number }>,
-    totalConsumed: number,
-  ): HighSpeedDrain {
-    let liters = 0;
-    let events = 0;
-    let prevFuel: number | null = null;
-    let prevSpeed: number | null = null;
-
-    for (const row of rows) {
-      if (row.fuel === null) continue;
-      if (prevFuel !== null && prevSpeed !== null) {
-        const delta = row.fuel - prevFuel;
-        if (prevSpeed > HIGH_SPEED_THRESHOLD_KMH && delta < -NOISE_THRESHOLD) {
-          liters += Math.abs(delta);
-          events++;
-        }
-      }
-      prevFuel = row.fuel;
-      prevSpeed = row.speed;
-    }
-
-    liters = Math.round(liters * 100) / 100;
-    const percentage =
-      totalConsumed > 0
-        ? Math.round((liters / totalConsumed) * 100 * 10) / 10
-        : 0;
-
-    return { liters, percentage, events };
-  }
-
   // ─── Daily Trend ──────────────────────────────────────────────────────────────
 
-  private calcDailyTrend(
-    rows: Array<{ ts: Date; fuel: number | null; lat: number; lng: number }>,
+  /**
+   * One point per day of the range. Days are 24 h windows counted from
+   * `from`, which the portal always sends as the user's local midnight — so a
+   * day here is the same day the user (and the GPS server, in the user's
+   * timezone) means. Grouping by UTC date used to split every Pakistan day at
+   * 05:00 into two half-days.
+   *
+   * Each day's burn is periodConsumed() over that day, i.e. exactly what the
+   * dashboard shows when that day is picked.
+   */
+  private async calcDailyTrend(
+    imei: string,
+    sensor: FuelSensor,
+    rows: EnrichedRow[],
     from: Date,
     to: Date,
-    unit: string,
-  ): DailyTrendPoint[] {
-    // Group rows by date string (YYYY-MM-DD UTC)
-    const byDay = new Map<string, typeof rows>();
-
-    for (const row of rows) {
-      const dateKey = row.ts.toISOString().slice(0, 10);
-      if (!byDay.has(dateKey)) byDay.set(dateKey, []);
-      byDay.get(dateKey)!.push(row);
-    }
-
+  ): Promise<DailyTrendPoint[]> {
     const trend: DailyTrendPoint[] = [];
 
-    for (const [date, dayRows] of byDay) {
-      // Consumed for the day
-      let consumed = 0;
-      let prevFuel: number | null = null;
-      for (const r of dayRows) {
-        if (r.fuel === null) continue;
-        if (prevFuel !== null) {
-          const delta = r.fuel - prevFuel;
-          if (delta < -NOISE_THRESHOLD) consumed += Math.abs(delta);
-        }
-        prevFuel = r.fuel;
-      }
+    for (let start = from.getTime(); start < to.getTime(); start += DAY_MS) {
+      const end = Math.min(start + DAY_MS, to.getTime());
+      const dayRows = rows.filter((r) => {
+        const t = r.ts.getTime();
+        return t >= start && t < end;
+      });
+      if (dayRows.length === 0) continue;
 
-      // Distance for the day
-      let distanceKm = 0;
-      for (let i = 1; i < dayRows.length; i++) {
-        const a = dayRows[i - 1];
-        const b = dayRows[i];
-        if (!a.lat || !a.lng || !b.lat || !b.lng) continue;
-        distanceKm += this.haversineKm(a.lat, a.lng, b.lat, b.lng);
-      }
-
-      consumed = Math.round(consumed * 100) / 100;
-      distanceKm = Math.round(distanceKm * 100) / 100;
-
+      const consumed =
+        Math.round(
+          (await this.consumedBetween(
+            imei,
+            new Date(start),
+            new Date(end),
+            sensor,
+          )) * 100,
+        ) / 100;
+      const km = trackDistanceKm(dayRows);
+      const distanceKm = Math.round(km * 100) / 100;
       const kmPerLiter =
-        consumed > 0 && distanceKm > 0
-          ? Math.round((distanceKm / consumed) * 100) / 100
-          : null;
+        consumed > 0 && km > 0 ? Math.round((km / consumed) * 100) / 100 : null;
 
       trend.push({
-        date,
+        // Local calendar date of the window: its midday is on that date in
+        // UTC for any offset within ±12 h.
+        date: new Date(start + DAY_MS / 2).toISOString().slice(0, 10),
         consumed,
         distanceKm,
         kmPerLiter,
@@ -342,8 +250,6 @@ export class ThriftService {
       });
     }
 
-    // Sort by date ascending
-    trend.sort((a, b) => a.date.localeCompare(b.date));
     return trend;
   }
 
@@ -353,7 +259,6 @@ export class ThriftService {
     idlePercentage: number,
     overspeedPercentage: number,
     kmPerLiter: number | null,
-    fleetAvgKmPerLiter: number | null,
   ): ThriftScore {
     // Idle penalty: max 30 points deducted at 75%+ idle
     const idlePenalty = Math.min(30, Math.round((idlePercentage / 75) * 30));

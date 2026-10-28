@@ -16,8 +16,6 @@ import {
   normalizeTripFuelToPeriod,
 } from '../fuel/services/trip-analyzer.service';
 
-const NOISE_THRESHOLD = 0.5;
-
 @Injectable()
 export class ReportsService {
   private readonly logger = new Logger(ReportsService.name);
@@ -212,7 +210,9 @@ export class ReportsService {
             sensor,
             v.fcr ?? '',
           );
+          // Verified only, so the report's total equals the vehicles' "refueled".
           for (const r of result.refuels) {
+            if (r.isVerified === false) continue;
             allEvents.push({
               imei: v.imei,
               name: v.name,
@@ -250,67 +250,18 @@ export class ReportsService {
     const results = await Promise.all(
       vehicles.map(async (v) => {
         try {
+          // Same figures as the thrift card: the period's real burn, with the
+          // idle share of it — not a raw sum of sensor falls.
           const sensor = await this.sensorResolver.resolveFuelSensor(v.imei);
-          const rows = await this.dynQuery.getRowsInRange(v.imei, from, to);
-
-          let idleLiters = 0;
-          let totalConsumed = 0;
-          let prevFuel: number | null = null;
-          let prevSpeed: number | null = null;
-          let prevIgnition: boolean | null = null;
-
-          for (const row of rows) {
-            const ts = new Date(row.dt_tracker);
-            const rawValue = this.transform.extractRawValue(
-              row.params,
-              sensor.param,
-              v.imei,
-              ts.toISOString(),
-            );
-            if (rawValue === null) continue;
-            const { value } = this.transform.transform(rawValue, sensor);
-            if (value === null) continue;
-
-            let ignition = false;
-            try {
-              const p = JSON.parse(row.params) as Record<
-                string,
-                string | number
-              >;
-              ignition =
-                p['acc'] === '1' ||
-                p['acc'] === 1 ||
-                p['io1'] === '1' ||
-                p['io1'] === 1;
-            } catch {
-              /* no ignition field */
-            }
-
-            if (
-              prevFuel !== null &&
-              prevSpeed !== null &&
-              prevIgnition !== null
-            ) {
-              const delta = value - prevFuel;
-              if (delta < -NOISE_THRESHOLD) {
-                totalConsumed += Math.abs(delta);
-                if (prevSpeed < 2 && prevIgnition) {
-                  idleLiters += Math.abs(delta);
-                }
-              }
-            }
-
-            prevFuel = value;
-            prevSpeed = row.speed;
-            prevIgnition = ignition;
-          }
-
-          idleLiters = Math.round(idleLiters * 100) / 100;
-          totalConsumed = Math.round(totalConsumed * 100) / 100;
-          const percentage =
-            totalConsumed > 0
-              ? Math.round((idleLiters / totalConsumed) * 100 * 10) / 10
-              : 0;
+          const thrift = await this.thriftService.getThrift(
+            v.imei,
+            from,
+            to,
+            sensor,
+          );
+          const totalConsumed = thrift.consumed;
+          const idleLiters = thrift.idleDrain.liters;
+          const percentage = thrift.idleDrain.percentage;
 
           fleetIdleLiters += idleLiters;
           fleetConsumed += totalConsumed;
@@ -371,48 +322,18 @@ export class ReportsService {
     const results = await Promise.all(
       vehicles.map(async (v) => {
         try {
+          // Same figures as the thrift card (see the idle-waste report).
           const sensor = await this.sensorResolver.resolveFuelSensor(v.imei);
-          const rows = await this.dynQuery.getRowsInRange(v.imei, from, to);
-
-          let highSpeedLiters = 0;
-          let highSpeedEvents = 0;
-          let totalConsumed = 0;
-          let prevFuel: number | null = null;
-          let prevSpeed: number | null = null;
-
-          for (const row of rows) {
-            const ts = new Date(row.dt_tracker);
-            const rawValue = this.transform.extractRawValue(
-              row.params,
-              sensor.param,
-              v.imei,
-              ts.toISOString(),
-            );
-            if (rawValue === null) continue;
-            const { value } = this.transform.transform(rawValue, sensor);
-            if (value === null) continue;
-
-            if (prevFuel !== null && prevSpeed !== null) {
-              const delta = value - prevFuel;
-              if (delta < -NOISE_THRESHOLD) {
-                totalConsumed += Math.abs(delta);
-                if (prevSpeed > HIGH_SPEED_KMH) {
-                  highSpeedLiters += Math.abs(delta);
-                  highSpeedEvents++;
-                }
-              }
-            }
-
-            prevFuel = value;
-            prevSpeed = row.speed;
-          }
-
-          highSpeedLiters = Math.round(highSpeedLiters * 100) / 100;
-          totalConsumed = Math.round(totalConsumed * 100) / 100;
-          const percentage =
-            totalConsumed > 0
-              ? Math.round((highSpeedLiters / totalConsumed) * 100 * 10) / 10
-              : 0;
+          const thrift = await this.thriftService.getThrift(
+            v.imei,
+            from,
+            to,
+            sensor,
+          );
+          const totalConsumed = thrift.consumed;
+          const highSpeedLiters = thrift.highSpeedDrain.liters;
+          const highSpeedEvents = thrift.highSpeedDrain.events;
+          const percentage = thrift.highSpeedDrain.percentage;
 
           fleetHighSpeedLiters += highSpeedLiters;
           fleetConsumed += totalConsumed;
@@ -735,7 +656,7 @@ export class ReportsService {
         try {
           const sensor = await this.sensorResolver.resolveFuelSensor(v.imei);
           fuelUnit = sensor.units || 'L';
-          const latestRow = await this.dynQuery.getLatestRestingRow(v.imei);
+          const latestRow = await this.dynQuery.getLiveRow(v.imei);
           if (latestRow) {
             const ts = new Date(latestRow.dt_tracker).toISOString();
             const rawValue = this.transform.extractRawValue(
